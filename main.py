@@ -9,6 +9,7 @@ def run():
     problem1 = parse_file_to_problem("data/teste_branch.txt")
     milp_solver1 = MILPSolver(problem1)
     solution1 = milp_solver1.solve()
+    print(solution1)
 
     # Teste 2: Problema com binárias
     print("\n\n==============================================")
@@ -17,6 +18,7 @@ def run():
     problem2 = parse_file_to_problem("data/exemplo_simples.txt")
     milp_solver2 = MILPSolver(problem2)
     solution2 = milp_solver2.solve()
+    print(solution2)
 
     # Teste 3: Problema da mochila
     print("\n\n==============================================")
@@ -24,7 +26,8 @@ def run():
     print("==============================================")
     problem3 = parse_file_to_problem("data/knapsack_test.txt")
     milp_solver3 = MILPSolver(problem3)
-    solution2 = milp_solver3.solve()
+    solution3 = milp_solver3.solve()
+    print(solution3)
 
 if __name__ == "__main__":
     run()

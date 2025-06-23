@@ -21,19 +21,22 @@ class SimplexSolver:
             pivot_col = self._find_pivot_column()
             if pivot_col == -1: break
             pivot_row = self._find_pivot_row(pivot_col)
-            if pivot_row == -1: return {"status": "Unbounded"}
+            # --- MUDANÇA 1: Retorno em caso de falha ---
+            if pivot_row == -1: return {"status": "Unbounded"}, None, None
             self._pivot(pivot_row, pivot_col)
             
         # 4. Extrai e valida a solução
         solution = self._extract_solution()
         
-        # Validação final: se uma variável artificial ainda está na solução, o problema é inviável
         for var_idx in self.basis:
             if self.variable_names[var_idx].startswith('a_'):
                 if abs(self.tableau[self.basis.index(var_idx), -1]) > 1e-6:
-                     return {"status": "Infeasible"}
+                       # --- MUDANÇA 2: Retorno em caso de falha ---
+                       return {"status": "Infeasible"}, None, None
 
-        return solution
+        # --- MUDANÇA 3: Retorno principal ---
+        # Agora retorna a solução, a tabela e a base
+        return solution, self.tableau, self.basis
 
     def _prepare_problem(self):
         # Adiciona limites de variáveis como restrições explícitas
@@ -75,7 +78,6 @@ class SimplexSolver:
                 artificial_needed_rows.append(i)
         return A_std, b, c_std, var_names, artificial_needed_rows
 
-# Dentro da classe SimplexSolver...
     def _build_initial_tableau(self, A_std, b_std, c_std, artificial_needed_rows):
         num_constraints, num_vars_std = A_std.shape
         num_artificial = len(artificial_needed_rows)
@@ -138,14 +140,23 @@ class SimplexSolver:
     def _extract_solution(self):
         solution = {name: 0.0 for name in self.problem.variable_names}
         num_orig_vars = len(self.problem.variable_names)
+        
+        # Pega os valores das variáveis básicas da tabela
         for i, basis_var_idx in enumerate(self.basis):
             if basis_var_idx < num_orig_vars:
-                solution[self.variable_names[basis_var_idx]] = self.tableau[i, -1]
-        
+                var_name = self.variable_names[basis_var_idx]
+                value = self.tableau[i, -1]
+                # --- MUDANÇA AQUI: Arredondamos o valor para lidar com a imprecisão ---
+                solution[var_name] = round(value, 6)
+
+        # Recalcula o valor da F.O. com os valores já limpos
         obj_val = 0
         for var, val in solution.items():
-            if abs(val) > 1e-6:
+            if abs(val) > 1e-9:
                 idx = self.problem.variable_names.index(var)
                 obj_val += self.problem.objective_coeffs[idx] * val
+        
+        # Arredonda o valor final do objetivo também
+        final_objective = round(obj_val, 6)
 
-        return {"status": "Optimal", "variables": solution, "objective_value": obj_val}
+        return {"status": "Optimal", "variables": solution, "objective_value": final_objective}
