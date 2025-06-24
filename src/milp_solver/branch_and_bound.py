@@ -6,6 +6,8 @@ from src.core.problem import Problem, ConstraintSense
 from src.lp_solver.simplex import SimplexSolver
 from.cuts import generate_gomory_cut
 from .heuristics import rounding_heuristic
+from .presolve_adapter import convert_problem_to_presolver_format
+from src.presolve.MIP_presolver import MIPPresolver
 
 TOLERANCE = 1e-6
 
@@ -20,9 +22,51 @@ class MILPSolver:
 
     def solve(self):
         print("--- Iniciando o Solver Branch and Bound ---")
-        # --- PASSO 1: TRATAMENTO DO NÓ RAIZ ---
-        print("\n--- Resolvendo o nó raiz... ---")
-        root_solver = SimplexSolver(self.root_problem)
+        # =================================================================
+        # ETAPA 1: PRÉ-PROCESSAMENTO (PRESOLVE)
+        # =================================================================
+        print("\n--- Fase 1: Pré-processamento (Presolve) ---")
+        try:
+            presolve_vars, presolve_constrs = convert_problem_to_presolver_format(self.root_problem)
+            presolver = MIPPresolver(presolve_vars, presolve_constrs)
+
+            # --- BLOCO DE DIAGNÓSTICO UNIVERSAL: ANTES ---
+            print("\n  Estado do Problema ANTES do Presolve:")
+            print(f"    - Número de Variáveis: {len(presolver.variables)}")
+            print(f"    - Número de Restrições: {len(presolver.constraints)}")
+            print("    - Limites das primeiras variáveis:")
+            for i, (var_name, info) in enumerate(presolver.variables.items()):
+                if i >= 3: break # Imprime os 3 primeiros para não poluir a tela
+                print(f"      - {info['lb']} <= {var_name} <= {info['ub']}")
+            # ---------------------------------------------
+
+            print("\n  Executando métodos de Presolve...")
+            presolver.bound_propagation()
+            # Adicione outras chamadas aqui se desejar testá-las
+            print("  ...Presolve concluído.")
+
+            # --- BLOCO DE DIAGNÓSTICO UNIVERSAL: DEPOIS ---
+            print("\n  Estado do Problema DEPOIS do Presolve:")
+            print(f"    - Número de Variáveis: {len(presolver.variables)}")
+            print(f"    - Número de Restrições: {len(presolver.constraints)}")
+            print("    - Limites das primeiras variáveis (após presolve):")
+            for i, (var_name, info) in enumerate(presolver.variables.items()):
+                if i >= 3: break
+                print(f"      - {info['lb']} <= {var_name} <= {info['ub']}")
+            # ----------------------------------------------
+            
+            # POR FAZER: Adaptar de volta para o nosso formato de Problem
+            processed_problem = self.root_problem 
+
+        except Exception as e:
+            print(f"  --> Erro durante o presolve: {e}. Continuando com o problema original.")
+            processed_problem = self.root_problem
+        
+        # =================================================================
+        # ETAPA 2: RESOLVER O NÓ RAIZ E EXECUTAR HEURÍSTICA
+        # =================================================================
+        print("\n--- Fase 2: Resolvendo Nó Raiz e Executando Heurística ---")
+        root_solver = SimplexSolver(processed_problem)
         root_solution_dict, _, _ = root_solver.solve()
 
         if not root_solution_dict or root_solution_dict["status"] != "Optimal":
@@ -32,11 +76,8 @@ class MILPSolver:
         self.upper_bound = root_solution_dict["objective_value"]
         print(f"Limite Superior Inicial (Upper Bound): {self.upper_bound:.4f}")
 
-        # --- PASSO 2: HEURÍSTICA PRIMAL ---
-        # Tentamos encontrar uma boa solução inicial antes de começar a busca pesada.
-        heuristic_solution = rounding_heuristic(self.root_problem, root_solution_dict)
+        heuristic_solution = rounding_heuristic(processed_problem, root_solution_dict)
         if heuristic_solution:
-            # Se a heurística encontrou uma solução, ela é nosso primeiro 'melhor candidato'.
             self.best_integer_solution = heuristic_solution
             self.lower_bound = self._recalculate_objective(heuristic_solution["variables"])
             print(f"*** Heurística definiu Lower Bound inicial para: {self.lower_bound:.4f} ***")
@@ -44,17 +85,19 @@ class MILPSolver:
                 gap = (self.upper_bound - self.lower_bound) / abs(self.upper_bound)
                 print(f"  ---> GAP INICIAL: {gap:.2%}")
 
-        # --- PASSO 3: PREPARAÇÃO DO LOOP B&C ---
-        # Verifica se a solução do nó raiz já é inteira (pode ser melhor que a da heurística).
-        if self._is_integer_feasible(root_solution_dict["variables"], self.root_problem):
+        # =================================================================
+        # ETAPA 3: BRANCH AND CUT
+        # =================================================================
+        self.node_queue.append(processed_problem) # Começa a fila com o problema (pós-presolve)
+        
+        # Verifica se a solução do nó raiz já é a resposta final
+        if self._is_integer_feasible(root_solution_dict["variables"], processed_problem):
             obj_val = self._recalculate_objective(root_solution_dict["variables"])
             if obj_val > self.lower_bound:
-                print(f"Solução do nó raiz é inteira e melhor que a da heurística! LB: {obj_val:.4f}")
                 self.lower_bound = obj_val
                 self.best_integer_solution = root_solution_dict
-        else:
-            # Se a solução do nó raiz não for inteira, adiciona à fila para iniciar a busca.
-            self.node_queue.append(self.root_problem)
+            print("Solução do nó raiz é inteira e ótima. Busca não é necessária.")
+            self.node_queue = [] # Esvazia a fila
 
         iteration = 0
         max_b_and_b_iterations = 200

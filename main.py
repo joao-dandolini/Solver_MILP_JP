@@ -2,7 +2,7 @@ from src.utils.parser import parse_file_to_problem
 from src.milp_solver.branch_and_bound import MILPSolver
 
 def run():
-    '''
+    #'''
     # Teste 1: Problema que força ramificação
     print("==============================================")
     print("   RESOLVENDO: teste_branch.txt")
@@ -20,7 +20,7 @@ def run():
     milp_solver2 = MILPSolver(problem2)
     solution2 = milp_solver2.solve()
     print(solution2)
-
+    
     # Teste 3: Problema da mochila
     print("\n\n==============================================")
     print("   RESOLVENDO: exemplo_simples.txt")
@@ -38,6 +38,7 @@ def run():
     milp_solver4 = MILPSolver(problem4)
     solution4 = milp_solver4.solve()
     print(solution4)
+    #'''
 
 if __name__ == "__main__":
     run()
