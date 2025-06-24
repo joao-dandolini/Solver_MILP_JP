@@ -6,3 +6,5 @@ Integração do seu presolve: Simplifica todos os problemas que resolveremos a p
 Heurísticas Primais: Encontrar um bom Lower Bound cedo é a forma mais eficaz de acelerar a poda.
 Integração do seu clique_cut: Com a infraestrutura de cortes pronta, adicionar um novo tipo é um passo natural.
 Melhorias de Visualização: Feitas incrementalmente ao longo de todo o processo.
+
+Adicionar API de modelagem addvar e addconstraint

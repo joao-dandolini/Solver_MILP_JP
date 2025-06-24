@@ -29,8 +29,8 @@ def run():
     milp_solver3 = MILPSolver(problem3)
     solution3 = milp_solver3.solve()
     print(solution3)
-    '''
-    # Teste 3: Problema complexo
+    #'''
+    # Teste 4: Problema complexo
     print("\n\n==============================================")
     print("   RESOLVENDO: desafio_complexo.txt")
     print("==============================================")

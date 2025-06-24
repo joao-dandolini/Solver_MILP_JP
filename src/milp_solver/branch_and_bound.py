@@ -5,6 +5,7 @@ import heapq
 from src.core.problem import Problem, ConstraintSense
 from src.lp_solver.simplex import SimplexSolver
 from.cuts import generate_gomory_cut
+from .heuristics import rounding_heuristic
 
 TOLERANCE = 1e-6
 
@@ -17,10 +18,43 @@ class MILPSolver:
         self.upper_bound = float('inf')
         self.node_count = 0  # Usado para desempate na fila
 
-# Dentro da classe MILPSolver, substitua o método solve inteiro por este:
     def solve(self):
         print("--- Iniciando o Solver Branch and Bound ---")
-        self.node_queue.append(self.root_problem)
+        # --- PASSO 1: TRATAMENTO DO NÓ RAIZ ---
+        print("\n--- Resolvendo o nó raiz... ---")
+        root_solver = SimplexSolver(self.root_problem)
+        root_solution_dict, _, _ = root_solver.solve()
+
+        if not root_solution_dict or root_solution_dict["status"] != "Optimal":
+            print("Problema raiz infactível ou ilimitado. Encerrando.")
+            return None
+            
+        self.upper_bound = root_solution_dict["objective_value"]
+        print(f"Limite Superior Inicial (Upper Bound): {self.upper_bound:.4f}")
+
+        # --- PASSO 2: HEURÍSTICA PRIMAL ---
+        # Tentamos encontrar uma boa solução inicial antes de começar a busca pesada.
+        heuristic_solution = rounding_heuristic(self.root_problem, root_solution_dict)
+        if heuristic_solution:
+            # Se a heurística encontrou uma solução, ela é nosso primeiro 'melhor candidato'.
+            self.best_integer_solution = heuristic_solution
+            self.lower_bound = self._recalculate_objective(heuristic_solution["variables"])
+            print(f"*** Heurística definiu Lower Bound inicial para: {self.lower_bound:.4f} ***")
+            if abs(self.upper_bound) > TOLERANCE:
+                gap = (self.upper_bound - self.lower_bound) / abs(self.upper_bound)
+                print(f"  ---> GAP INICIAL: {gap:.2%}")
+
+        # --- PASSO 3: PREPARAÇÃO DO LOOP B&C ---
+        # Verifica se a solução do nó raiz já é inteira (pode ser melhor que a da heurística).
+        if self._is_integer_feasible(root_solution_dict["variables"], self.root_problem):
+            obj_val = self._recalculate_objective(root_solution_dict["variables"])
+            if obj_val > self.lower_bound:
+                print(f"Solução do nó raiz é inteira e melhor que a da heurística! LB: {obj_val:.4f}")
+                self.lower_bound = obj_val
+                self.best_integer_solution = root_solution_dict
+        else:
+            # Se a solução do nó raiz não for inteira, adiciona à fila para iniciar a busca.
+            self.node_queue.append(self.root_problem)
 
         iteration = 0
         max_b_and_b_iterations = 200
@@ -34,7 +68,6 @@ class MILPSolver:
             current_problem = self.node_queue.pop(0)
             print(f"\n--- Iteração B&B {iteration}: Resolvendo {current_problem.name} ---")
 
-            # --- INÍCIO DO LOOP DE CORTE ---
             # Para cada nó, tentamos adicionar até 10 cortes para fortalecê-lo
             max_cuts_per_node = 10
             for cut_iteration in range(max_cuts_per_node):
@@ -74,7 +107,6 @@ class MILPSolver:
                     # Se não há mais cortes a adicionar, saia do loop de corte
                     print("  Nenhum corte de Gomory adicional encontrado.")
                     break
-            # --- FIM DO LOOP DE CORTE ---
 
             # --- ANÁLISE DO RESULTADO FINAL DO NÓ (APÓS TENTATIVAS DE CORTE) ---
             if not solution or solution["status"] != "Optimal":
@@ -117,8 +149,6 @@ class MILPSolver:
             problem_up = self._add_bound_to_problem(current_problem, branch_var_name, ">=", np.floor(branch_var_value) + 1)
             
             self.node_queue.extend([problem_down, problem_up])
-
-        # ... (O resto da função, com a impressão final, permanece o mesmo) ...
 
         print("\n--- Fim da Execução do Branch and Bound ---")
         if self.best_integer_solution:
