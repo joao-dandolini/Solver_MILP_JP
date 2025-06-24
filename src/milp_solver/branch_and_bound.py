@@ -6,7 +6,7 @@ from src.core.problem import Problem, ConstraintSense
 from src.lp_solver.simplex import SimplexSolver
 from.cuts import generate_gomory_cut
 from .heuristics import rounding_heuristic
-from .presolve_adapter import convert_problem_to_presolver_format
+from .presolve_adapter import convert_problem_to_presolver_format, convert_presolver_to_problem_format
 from src.presolve.MIP_presolver import MIPPresolver
 
 TOLERANCE = 1e-6
@@ -35,8 +35,9 @@ class MILPSolver:
             print(f"    - Número de Variáveis: {len(presolver.variables)}")
             print(f"    - Número de Restrições: {len(presolver.constraints)}")
             print("    - Limites das primeiras variáveis:")
-            for i, (var_name, info) in enumerate(presolver.variables.items()):
-                if i >= 3: break # Imprime os 3 primeiros para não poluir a tela
+            vars_to_print_before = list(presolver.variables.keys())
+            for var_name in vars_to_print_before:
+                info = presolver.variables[var_name]
                 print(f"      - {info['lb']} <= {var_name} <= {info['ub']}")
             # ---------------------------------------------
 
@@ -50,13 +51,21 @@ class MILPSolver:
             print(f"    - Número de Variáveis: {len(presolver.variables)}")
             print(f"    - Número de Restrições: {len(presolver.constraints)}")
             print("    - Limites das primeiras variáveis (após presolve):")
-            for i, (var_name, info) in enumerate(presolver.variables.items()):
-                if i >= 3: break
-                print(f"      - {info['lb']} <= {var_name} <= {info['ub']}")
+            vars_to_print_after = list(presolver.variables.keys())
+            if not vars_to_print_after:
+                print("      - Nenhuma variável restante após o presolve.")
+            else:
+                for var_name in vars_to_print_after:
+                    info = presolver.variables[var_name]
+                    print(f"      - {info['lb']} <= {var_name} <= {info['ub']}")
             # ----------------------------------------------
             
-            # POR FAZER: Adaptar de volta para o nosso formato de Problem
-            processed_problem = self.root_problem 
+            # 1c. VOLTA: Traduzir de volta para o nosso formato Problem
+            print("\n  Reconstruindo problema simplificado...")
+            processed_problem = convert_presolver_to_problem_format(
+                presolver.variables, presolver.constraints, self.root_problem
+            )
+            print("  Presolve concluído e problema reconstruído!")
 
         except Exception as e:
             print(f"  --> Erro durante o presolve: {e}. Continuando com o problema original.")
