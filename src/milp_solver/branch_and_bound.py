@@ -97,6 +97,12 @@ class MILPSolver:
                     self.lower_bound = obj_val
                     solution['objective_value'] = obj_val
                     self.best_integer_solution = solution
+
+                    # Apenas calculamos e imprimimos o GAP quando encontramos uma solução melhor.
+                    if self.upper_bound != float('inf') and abs(self.upper_bound) > 1e-9:
+                        gap = (self.upper_bound - self.lower_bound) / abs(self.upper_bound)
+                        print(f"  ---> NOVO GAP DE OTIMALIDADE: {gap:.2%}")
+                        
                 continue
 
             # Se, mesmo após os cortes, a solução ainda for fracionária, ramificamos.
