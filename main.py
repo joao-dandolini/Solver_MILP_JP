@@ -2,7 +2,7 @@ from src.utils.parser import parse_file_to_problem
 from src.milp_solver.branch_and_bound import MILPSolver
 
 def run():
-    #'''
+    '''
     # Teste 1: Problema que força ramificação
     print("==============================================")
     print("   RESOLVENDO: teste_branch.txt")
@@ -20,16 +20,17 @@ def run():
     milp_solver2 = MILPSolver(problem2)
     solution2 = milp_solver2.solve()
     print(solution2)
-    
+
+    '''
     # Teste 3: Problema da mochila
     print("\n\n==============================================")
-    print("   RESOLVENDO: exemplo_simples.txt")
+    print("   RESOLVENDO: knapsack_test.txt")
     print("==============================================")
     problem3 = parse_file_to_problem("data/knapsack_test.txt")
     milp_solver3 = MILPSolver(problem3)
     solution3 = milp_solver3.solve()
     print(solution3)
-    #'''
+    '''
     # Teste 4: Problema complexo
     print("\n\n==============================================")
     print("   RESOLVENDO: desafio_complexo.txt")
@@ -38,6 +39,15 @@ def run():
     milp_solver4 = MILPSolver(problem4)
     solution4 = milp_solver4.solve()
     print(solution4)
+
+    # Teste 5: Problema da mochila_2
+    print("\n\n==============================================")
+    print("   RESOLVENDO: knapsack_test_2.txt")
+    print("==============================================")
+    problem5 = parse_file_to_problem("data/knapsack_test_2.txt")
+    milp_solver5 = MILPSolver(problem5)
+    solution5 = milp_solver5.solve()
+    print(solution5)
     #'''
 
 if __name__ == "__main__":

@@ -2,10 +2,10 @@
 ProblemaDaMochilaExplorador
 
 [OBJECTIVE]
-max: 15x_lanterna + 30x_comida + 25x_kit_medico + 35x_corda + 20x_camera + 25x_garrafa + 10x_canivete + 12x_bussola + 400x_sem_sentido
+max: 15x_lanterna + 30x_comida + 25x_kit_medico + 35x_corda + 20x_camera + 25x_garrafa + 10x_canivete + 12x_bussola + 400x_sem_sentido + 100x_corte1 + 101x_corte2
 
 [CONSTRAINTS]
-capacidade: 2x_lanterna + 4x_comida + 3x_kit_medico + 5x_corda + 2x_camera + 3x_garrafa + 1x_canivete + 1x_bussola + 40x_sem_sentido <= 12
+capacidade: 2x_lanterna + 4x_comida + 3x_kit_medico + 5x_corda + 2x_camera + 3x_garrafa + 1x_canivete + 1x_bussola + 40x_sem_sentido + 7x_corte1 + 7x_corte2 <= 12
 
 [BINARY]
 x_lanterna
@@ -17,3 +17,5 @@ x_garrafa
 x_canivete
 x_bussola
 x_sem_sentido
+x_corte1
+x_corte2

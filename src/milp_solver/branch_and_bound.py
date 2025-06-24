@@ -7,6 +7,7 @@ from src.lp_solver.simplex import SimplexSolver
 from.cuts import generate_gomory_cut
 from .heuristics import rounding_heuristic
 from .presolve_adapter import convert_problem_to_presolver_format, convert_presolver_to_problem_format
+from .clique_manager import initialize_conflict_graph, separate_clique_cuts
 from src.presolve.MIP_presolver import MIPPresolver
 
 TOLERANCE = 1e-6
@@ -19,6 +20,7 @@ class MILPSolver:
         self.lower_bound = -float('inf')
         self.upper_bound = float('inf')
         self.node_count = 0  # Usado para desempate na fila
+        self.conflict_graph = None
 
     def solve(self):
         print("--- Iniciando o Solver Branch and Bound ---")
@@ -70,11 +72,14 @@ class MILPSolver:
         except Exception as e:
             print(f"  --> Erro durante o presolve: {e}. Continuando com o problema original.")
             processed_problem = self.root_problem
-        
+
+        # --- ETAPA 2: ANÁLISE ESTRUTURAL (CLIQUE) ---
+        print("\n--- Fase 2: Análise Estrutural para Cortes de Clique ---")
+        self.conflict_graph = initialize_conflict_graph(processed_problem)
         # =================================================================
-        # ETAPA 2: RESOLVER O NÓ RAIZ E EXECUTAR HEURÍSTICA
+        # ETAPA 3: RESOLVER O NÓ RAIZ E EXECUTAR HEURÍSTICA
         # =================================================================
-        print("\n--- Fase 2: Resolvendo Nó Raiz e Executando Heurística ---")
+        print("\n--- Fase 3: Resolvendo Nó Raiz e Executando Heurística ---")
         root_solver = SimplexSolver(processed_problem)
         root_solution_dict, _, _ = root_solver.solve()
 
@@ -95,7 +100,7 @@ class MILPSolver:
                 print(f"  ---> GAP INICIAL: {gap:.2%}")
 
         # =================================================================
-        # ETAPA 3: BRANCH AND CUT
+        # ETAPA 4: BRANCH AND CUT
         # =================================================================
         self.node_queue.append(processed_problem) # Começa a fila com o problema (pós-presolve)
         
@@ -109,7 +114,7 @@ class MILPSolver:
             self.node_queue = [] # Esvazia a fila
 
         iteration = 0
-        max_b_and_b_iterations = 200
+        max_b_and_b_iterations = 2000
 
         while self.node_queue:
             if iteration >= max_b_and_b_iterations:
@@ -118,47 +123,54 @@ class MILPSolver:
             iteration += 1
 
             current_problem = self.node_queue.pop(0)
+            problem_for_branching = copy.deepcopy(current_problem)
             print(f"\n--- Iteração B&B {iteration}: Resolvendo {current_problem.name} ---")
 
             # Para cada nó, tentamos adicionar até 10 cortes para fortalecê-lo
-            max_cuts_per_node = 10
+            max_cuts_per_node = 3 # Podemos aumentar a agressividade um pouco
             for cut_iteration in range(max_cuts_per_node):
-                print(f"  Tentativa de corte {cut_iteration + 1}/{max_cuts_per_node}...")
+                print(f"  Rodada de cortes {cut_iteration + 1}/{max_cuts_per_node}...")
                 
                 lp_solver = SimplexSolver(current_problem)
                 solution, final_tableau, final_basis = lp_solver.solve()
                 
-                # Se o LP falhar, não podemos gerar cortes, saia do loop de corte
                 if not solution or solution["status"] != "Optimal":
-                    print("  LP do nó falhou, impossível gerar cortes.")
+                    print("  LP do nó falhou, impossível gerar mais cortes.")
                     break
 
-                # Se a solução já for inteira, não precisamos de cortes
                 if self._is_integer_feasible(solution["variables"], current_problem):
-                    print("  Solução tornou-se inteira após corte. Saindo do loop de corte.")
+                    print("  Solução tornou-se inteira. Saindo do loop de corte.")
                     break
 
-                # Tenta gerar um corte de Gomory
-                new_cut = generate_gomory_cut(final_tableau, final_basis, lp_solver.variable_names, current_problem)
-                
-                if new_cut:
-                    #'''
-                    cut_coeffs = new_cut["coeffs"]
-                    cut_rhs = new_cut["rhs"]
-                    cut_sense = ">="
-                    # Formata a equação do corte para ser legível
-                    lhs_str = " + ".join([f"{coeff:.3f}*{var}" for var, coeff in cut_coeffs.items()])
-                    print(f"  --> Corte de Gomory Gerado: {lhs_str} {cut_sense} {cut_rhs:.3f}")
-                    #'''
-                    print("  Corte de Gomory encontrado! Adicionando ao problema e re-otimizando...")
-                    # O problema é atualizado com o novo corte para a próxima iteração do loop de corte
+                # Flag para saber se adicionamos algum corte nesta passada
+                cuts_found_this_pass = False
+
+                # 1. Tenta gerar cortes de Gomory
+                gomory_cut = generate_gomory_cut(final_tableau, final_basis, lp_solver.variable_names, current_problem)
+                if gomory_cut:
+                    print("  --> Corte de Gomory encontrado!")
                     current_problem = self._add_constraint_to_problem(
-                        current_problem, new_cut["coeffs"], new_cut["sense"], new_cut["rhs"]
+                        current_problem, gomory_cut["coeffs"], gomory_cut["sense"], gomory_cut["rhs"]
                     )
-                else:
-                    # Se não há mais cortes a adicionar, saia do loop de corte
-                    print("  Nenhum corte de Gomory adicional encontrado.")
+                    cuts_found_this_pass = True
+
+                # 2. Tenta gerar cortes de Clique
+                if self.conflict_graph: # Só tenta se o grafo de conflitos existir
+                    clique_cuts = separate_clique_cuts(self.conflict_graph, solution["variables"], current_problem)
+                    if clique_cuts:
+                        print(f"  --> {len(clique_cuts)} corte(s) de clique encontrado(s)!")
+                        for cut in clique_cuts:
+                            current_problem = self._add_constraint_to_problem(
+                                current_problem, cut["coeffs"], cut["sense"], cut["rhs"]
+                            )
+                        cuts_found_this_pass = True
+                
+                # Se nenhum dos geradores encontrou um corte, não adianta tentar de novo.
+                if not cuts_found_this_pass:
+                    print("  Nenhum corte adicional encontrado nesta rodada.")
                     break
+                else:
+                    print("  Problema fortalecido com cortes. Re-otimizando...")
 
             # --- ANÁLISE DO RESULTADO FINAL DO NÓ (APÓS TENTATIVAS DE CORTE) ---
             if not solution or solution["status"] != "Optimal":
@@ -197,8 +209,8 @@ class MILPSolver:
             branch_var_value = solution["variables"][branch_var_name]
             print(f"Ramificando em '{branch_var_name}' com valor {branch_var_value:.4f}")
             
-            problem_down = self._add_bound_to_problem(current_problem, branch_var_name, "<=", np.floor(branch_var_value))
-            problem_up = self._add_bound_to_problem(current_problem, branch_var_name, ">=", np.floor(branch_var_value) + 1)
+            problem_down = self._add_bound_to_problem(problem_for_branching, branch_var_name, "<=", np.floor(branch_var_value))
+            problem_up = self._add_bound_to_problem(problem_for_branching, branch_var_name, ">=", np.floor(branch_var_value) + 1)
             
             self.node_queue.extend([problem_down, problem_up])
 
