@@ -1,0 +1,16 @@
+[NAME]
+DesafioPlanejamentoProducao
+
+[OBJECTIVE]
+max: 18x_Pa + 25x_Pb + 12x_Pc
+
+[CONSTRAINTS]
+Maquinario: 7x_Pa + 11x_Pb + 5x_Pc <= 150
+MaoDeObra: 10x_Pa + 8x_Pb + 13x_Pc <= 200
+MaterialRaro: 3x_Pa + 2x_Pb + 4x_Pc <= 70
+Contrato: 1x_Pa + 1x_Pb >= 10
+
+[INTEGERS]
+x_Pa
+x_Pb
+x_Pc

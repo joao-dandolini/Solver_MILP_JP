@@ -1,0 +1,13 @@
+[NAME]
+TesteDeRamificacao
+
+[OBJECTIVE]
+max: 5x1 + 8x2
+
+[CONSTRAINTS]
+c1: 1x1 + 1x2 <= 6
+c2: 5x1 + 9x2 <= 45
+
+[INTEGERS]
+x1
+x2

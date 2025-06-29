@@ -1,0 +1,20 @@
+[NAME]
+MeuProblemaMisto
+
+[OBJECTIVE]
+max: 10x1 + 15x2 + 8z1 + 5z2
+
+[CONSTRAINTS]
+c1: 2x1 + 3x2 + 1z1 <= 100
+c2: 5x1 + 2x2 + 2z2 <= 80
+
+[BOUNDS]
+x1 >= 0
+x2 >= 0
+
+[INTEGERS]
+x1
+
+[BINARY]
+z1
+z2
