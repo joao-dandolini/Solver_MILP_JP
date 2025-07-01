@@ -269,7 +269,7 @@ def presolve_coefficient_tightening(problema: Problema) -> int:
 def presolve_propagate_bounds(problema: Problema) -> tuple:
     """
     Usa as restrições para deduzir limites mais apertados.
-    Retorna (sucesso, numero_de_mudancas).
+    Retorna (sucesso, numero_de_mudancas). Versão com lógica de arredondamento corrigida.
     """
     bounds_apertados = 0
     mudou = True
@@ -278,114 +278,208 @@ def presolve_propagate_bounds(problema: Problema) -> tuple:
         while mudou:
             mudou = False
             for constr in problema.model.getConstrs():
-                # ... (a lógica interna da função continua a mesma de antes) ...
                 linha = problema.model.getRow(constr)
                 if linha.size() == 0: continue
+
                 for i in range(linha.size()):
                     var_alvo = linha.getVar(i)
                     coeff_alvo = linha.getCoeff(i)
+                    
                     outras_vars_expr = linha.copy()
                     outras_vars_expr.remove(var_alvo)
                     min_act_outras, max_act_outras = _calculate_activity_bounds(outras_vars_expr)
+
                     old_lb, old_ub = var_alvo.LB, var_alvo.UB
-
-                    if constr.Sense == GRB.LESS_EQUAL:
-                        if coeff_alvo > 0:
-                            if max_act_outras != GRB.INFINITY:
-                                new_ub = (constr.RHS - min_act_outras) / coeff_alvo
-                                if new_ub < var_alvo.UB: var_alvo.setAttr('UB', new_ub)
-                        else:
-                            if min_act_outras != -GRB.INFINITY:
-                                new_lb = (constr.RHS - max_act_outras) / coeff_alvo
-                                if new_lb > var_alvo.LB: var_alvo.setAttr('LB', new_lb)
-                    elif constr.Sense == GRB.GREATER_EQUAL:
-                        if coeff_alvo > 0:
-                            if min_act_outras != -GRB.INFINITY:
-                                new_lb = (constr.RHS - max_act_outras) / coeff_alvo
-                                if new_lb > var_alvo.LB: var_alvo.setAttr('LB', new_lb)
-                        else:
-                            if max_act_outras != GRB.INFINITY:
-                                new_ub = (constr.RHS - min_act_outras) / coeff_alvo
-                                if new_ub < var_alvo.UB: var_alvo.setAttr('UB', new_ub)
-
-                    if var_alvo.VType != GRB.CONTINUOUS:
-                        var_alvo.setAttr('LB', math.ceil(var_alvo.LB))
-                        var_alvo.setAttr('UB', math.floor(var_alvo.UB))
                     
+                    # Lógica para derivação de novos limites (continua a mesma)
+                    if constr.Sense == GRB.LESS_EQUAL:
+                        if coeff_alvo > 0 and min_act_outras != -GRB.INFINITY:
+                            new_ub = (constr.RHS - min_act_outras) / coeff_alvo
+                            if new_ub < old_ub: var_alvo.setAttr('UB', new_ub)
+                        elif coeff_alvo < 0 and max_act_outras != GRB.INFINITY:
+                            new_lb = (constr.RHS - min_act_outras) / coeff_alvo
+                            if new_lb > old_lb: var_alvo.setAttr('LB', new_lb)
+                            
+                    elif constr.Sense == GRB.GREATER_EQUAL:
+                        if coeff_alvo > 0 and max_act_outras != GRB.INFINITY:
+                            new_lb = (constr.RHS - max_act_outras) / coeff_alvo
+                            if new_lb > old_lb: var_alvo.setAttr('LB', new_lb)
+                        elif coeff_alvo < 0 and min_act_outras != -GRB.INFINITY:
+                            new_ub = (constr.RHS - max_act_outras) / coeff_alvo
+                            if new_ub < old_ub: var_alvo.setAttr('UB', new_ub)
+
+                    # --- LÓGICA DE ARREDONDAMENTO CORRIGIDA E MAIS SEGURA ---
+                    if var_alvo.VType != GRB.CONTINUOUS:
+                        # Arredonda o limite inferior para cima, para o próximo inteiro
+                        novo_lb_arredondado = math.ceil(var_alvo.LB - 1e-9) # Usamos tolerância para dentro
+                        if novo_lb_arredondado > old_lb:
+                            var_alvo.setAttr('LB', novo_lb_arredondado)
+
+                        # Arredonda o limite superior para baixo, para o próximo inteiro
+                        novo_ub_arredondado = math.floor(var_alvo.UB + 1e-9) # Usamos tolerância para dentro
+                        if novo_ub_arredondado < old_ub:
+                             var_alvo.setAttr('UB', novo_ub_arredondado)
+                    # --- FIM DA CORREÇÃO ---
+
                     if var_alvo.LB > var_alvo.UB + 1e-9:
-                        # Em vez de lançar erro, retornamos falha
+                        logging.error(f"--> Inviabilidade Falsa em '{constr.ConstrName}' para '{var_alvo.VarName}': LB={var_alvo.LB} > UB={var_alvo.UB}")
                         return False, bounds_apertados
 
                     if var_alvo.LB > old_lb or var_alvo.UB < old_ub:
-                        mudou = True
-                        bounds_apertados += 1
+                        mudou = True; bounds_apertados += 1
         
         problema.model.update()
         return True, bounds_apertados
-
-    except Exception as e:
-        logging.error(f"Erro inesperado durante a propagação de limites: {e}")
+    except Exception:
+        # Se qualquer erro ocorrer, consideramos que a propagação falhou
         return False, bounds_apertados
-    
-def presolve_probing(problema: Problema) -> int:
+
+def presolve_probing(problema: Problema, max_candidates: int = 25) -> int:
     """
-    Testa fixar variáveis binárias em 0 e 1 e propaga os limites
-    para deduzir fixações ou provar inviabilidade.
+    Testa fixar variáveis binárias em 0 e 1, selecionando as candidatas
+    mais "impactantes" para sondar.
     """
-    vars_fixadas = 0
-    mudou_no_probing = True
+    vars_fixadas_total = 0
+    rodada_probing = 1
     
-    while mudou_no_probing:
-        mudou_no_probing = False
-        candidatos = [v for v in problema.model.getVars() if v.VType == GRB.BINARY and v.LB < 0.5 and v.UB > 0.5]
+    while True:
+        logging.debug(f"--- Probing (Rodada {rodada_probing}) ---")
+        mudou_nesta_rodada = False
         
-        for var in candidatos:
-            # Cria uma cópia para testar y=0
+        # --- LÓGICA DE SELEÇÃO INTELIGENTE ---
+        
+        # 1. Pega todos os candidatos possíveis (não fixos)
+        candidatos_full = [v for v in problema.model.getVars() if v.VType == GRB.BINARY and v.LB < 0.5 and v.UB > 0.5]
+        
+        if not candidatos_full: break
+
+        # 2. Calcula uma pontuação de impacto para cada um
+        candidatos_com_pontuacao = []
+        for v in candidatos_full:
+            # Pega a coluna para saber de quantas restrições a variável participa
+            coluna = problema.model.getCol(v)
+            num_constrs_participa = coluna.size()
+            
+            # Pontuação = |Custo no Objetivo| + (fator de peso * Número de Restrições)
+            # O fator de peso ajuda a balancear a importância dos dois termos
+            pontuacao = abs(v.Obj) + 0.5 * num_constrs_participa
+            candidatos_com_pontuacao.append((pontuacao, v))
+
+        # 3. Ordena os candidatos pela pontuação, do maior para o menor
+        candidatos_com_pontuacao.sort(key=lambda item: item[0], reverse=True)
+        
+        # 4. Seleciona os melhores 'max_candidates' para sondar
+        candidatos_para_sondar = [var for pontuacao, var in candidatos_com_pontuacao[:max_candidates]]
+        
+        nomes_dos_sondados = [v.VarName for v in candidatos_para_sondar]
+        logging.info(f"  -> Candidatos selecionados para sondagem: {nomes_dos_sondados}")
+
+        logging.debug(f"Encontrados {len(candidatos_full)} candidatos, sondando os {len(candidatos_para_sondar)} mais impactantes.")
+        # --- FIM DA LÓGICA INTELIGENTE ---
+
+        for var in candidatos_para_sondar:
+            # O resto da lógica de sondagem continua a mesma de antes...
+            if var.LB > 0.5 or var.UB < 0.5: continue
+            
+            # Teste para var=0
             model_copy_0 = problema.model.copy()
             model_copy_0.setParam('OutputFlag', 0)
             var_copy_0 = model_copy_0.getVarByName(var.VarName)
             var_copy_0.setAttr('UB', 0.0)
-            problema_copy_0 = Problema(problema_input=model_copy_0)
-            status_0, _ = presolve_propagate_bounds(problema_copy_0)
+            status_0, _ = presolve_propagate_bounds(Problema(problema_input=model_copy_0))
             model_copy_0.dispose()
 
-            # Cria uma cópia para testar y=1
+            # Teste para var=1
             model_copy_1 = problema.model.copy()
             model_copy_1.setParam('OutputFlag', 0)
             var_copy_1 = model_copy_1.getVarByName(var.VarName)
             var_copy_1.setAttr('LB', 1.0)
-            problema_copy_1 = Problema(problema_input=model_copy_1)
-            status_1, _ = presolve_propagate_bounds(problema_copy_1)
+            status_1, _ = presolve_propagate_bounds(Problema(problema_input=model_copy_1))
             model_copy_1.dispose()
 
-            # Analisa os resultados da sondagem
             if not status_0 and not status_1:
-                raise ValueError(f"Inviabilidade detectada (Probing): Var {var.VarName} inviável em ambos os ramos.")
+                raise ValueError(f"Inviabilidade (Probing): Var {var.VarName} inviável em ambos os ramos.")
             
-            if not status_0: # Fixar em 0 é inviável -> var DEVE ser 1
+            if not status_0:
                 if var.LB < 1.0:
-                    var.setAttr('LB', 1.0)
-                    vars_fixadas += 1
-                    mudou_no_probing = True
-                    logging.debug(f"Presolve (Probing): Variável {var.VarName} fixada em 1.")
+                    var.setAttr('LB', 1.0); vars_fixadas_total += 1; mudou_nesta_rodada = True
+                    logging.info(f"Presolve (Probing): Variável {var.VarName} fixada em 1.")
             
-            if not status_1: # Fixar em 1 é inviável -> var DEVE ser 0
+            if not status_1:
                 if var.UB > 0.0:
-                    var.setAttr('UB', 0.0)
-                    vars_fixadas += 1
-                    mudou_no_probing = True
-                    logging.debug(f"Presolve (Probing): Variável {var.VarName} fixada em 0.")
+                    var.setAttr('UB', 0.0); vars_fixadas_total += 1; mudou_nesta_rodada = True
+                    logging.info(f"Presolve (Probing): Variável {var.VarName} fixada em 0.")
         
-        if mudou_no_probing:
-            # Se fixamos alguma variável, rodamos a propagação no problema real
+        if mudou_nesta_rodada:
             presolve_propagate_bounds(problema)
+            rodada_probing += 1
+        else:
+            break
 
-    logging.info(f"  -> Presolve (Probing): {vars_fixadas} variáveis fixadas.")
-    return vars_fixadas
+    logging.info(f"  -> Presolve (Probing): {vars_fixadas_total} variáveis fixadas.")
+    return vars_fixadas_total
 
 # -------------------------------------------------
 # 2. A FUNÇÃO ORQUESTRADORA (POR ENQUANTO, SÓ CHAMA UMA TÉCNICA)
 # -------------------------------------------------
+
+# CÓDIGO FINAL para aplicar_presolve em aplicador.py
+
+def aplicar_presolve(problema: Problema) -> Problema:
+    """
+    Orquestra a aplicação de todas as técnicas de presolve em um loop
+    até que nenhuma nova mudança seja detectada em uma rodada completa.
+    """
+    logging.info("="*20 + " INICIANDO FASE DE PRESOLVE (CUSTOMIZADO) " + "="*20)
+    
+    rodada = 1
+    max_rodadas = 10 # Um limite de segurança para evitar loops infinitos
+    
+    while rodada <= max_rodadas:
+        mudancas_totais_na_rodada = 0
+        logging.info(f"--- Iniciando rodada {rodada} de Presolve ---")
+
+        # 1. Propagação de Limites (A mais fundamental)
+        sucesso, mudancas = presolve_propagate_bounds(problema)
+        if not sucesso: raise ValueError("Inviabilidade detectada durante a propagação de limites.")
+        if mudancas > 0: logging.info(f"  - Propagate Bounds encontrou {mudancas} mudanças.")
+        mudancas_totais_na_rodada += mudancas
+
+        # 2. Remoção de Colunas Singleton (Simples e segura)
+        mudancas = presolve_substitute_singletons(problema)
+        if mudancas > 0: logging.info(f"  - Singleton Columns encontrou {mudancas} mudanças.")
+        mudancas_totais_na_rodada += mudancas
+
+        # 3. Redundância Euclidiana (Segura)
+        mudancas = presolve_euclidean_reduction(problema)
+        if mudancas > 0: logging.info(f"  - Euclidean Redundancy encontrou {mudancas} mudanças.")
+        mudancas_totais_na_rodada += mudancas
+
+        # 4. Aperto de Coeficientes (Mais avançada)
+        mudancas = presolve_coefficient_tightening(problema)
+        if mudancas > 0: logging.info(f"  - Coefficient Tightening encontrou {mudancas} mudanças.")
+        mudancas_totais_na_rodada += mudancas
+
+        # 5. Probing (A mais poderosa e perigosa, por último)
+        # Descomente a linha abaixo para reativar o probing quando estivermos confiantes
+        mudancas = presolve_probing(problema)
+        if mudancas > 0: logging.info(f"  - Probing encontrou {mudancas} mudanças.")
+        mudancas_totais_na_rodada += mudancas
+
+        logging.info(f"Rodada de Presolve {rodada} concluída com {mudancas_totais_na_rodada} mudanças totais.")
+
+        # Se uma rodada inteira não produziu nenhuma mudança, o presolve terminou.
+        if mudancas_totais_na_rodada == 0:
+            logging.info("Nenhuma mudança detectada na rodada. Presolve estabilizado.")
+            break
+        
+        rodada += 1
+
+    logging.info("="*22 + " PRESOLVE CONCLUÍDO " + "="*22)
+    problema.model.update()
+    return problema
+
+'''
 def aplicar_presolve(problema: Problema) -> Problema:
     """
     Aplica uma sequência de técnicas de presolve em loop até que nenhuma
@@ -423,3 +517,4 @@ def aplicar_presolve(problema: Problema) -> Problema:
     logging.info("="*22 + " PRESOLVE CONCLUÍDO " + "="*22)
     problema.model.update()
     return problema
+'''

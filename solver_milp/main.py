@@ -19,18 +19,21 @@ def main():
     # 1. CONFIGURAÇÃO
     setup_logger()
     # Para ver mais detalhes do B&B, descomente a linha abaixo
-    #logging.getLogger().setLevel(logging.DEBUG) 
+    logging.getLogger().setLevel(logging.DEBUG) 
     
     logging.info("="*20 + " INICIANDO SOLVER MILP COMPLETO " + "="*20)
 
     # 2. LEITURA DO PROBLEMA
     try:
         # Definimos o caminho do arquivo que queremos resolver
-        caminho_problema = "../tests/mas76.mps"
-        sentido_desejado = GRB.MINIMIZE
-        #caminho_problema = "../tests/instance_0003.mps"
-        #sentido_desejado = GRB.MAXIMIZE
-        
+        opcao = 5
+        if opcao == 1:
+            caminho_problema = "../tests/mas76.mps"
+            sentido_desejado = GRB.MINIMIZE
+        else:
+            caminho_problema = "../tests/instance_0003.mps"
+            sentido_desejado = GRB.MAXIMIZE
+            
         # Carrega o problema. Gurobi pode assumir o sentido errado.
         problema_original = Problema(problema_input=caminho_problema, nome_problema="meu_problema")
 

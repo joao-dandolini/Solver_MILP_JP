@@ -19,12 +19,12 @@ class Problema:
         
         if isinstance(problema_input, str):
             # Se for uma string, é um caminho de arquivo. Usamos gp.read().
-            logging.info(f"Lendo modelo do arquivo: {problema_input}")
+            logging.debug(f"Lendo modelo do arquivo: {problema_input}")
             self.model: gp.Model = gp.read(problema_input)
             self.model.setParam('OutputFlag', 0)
         elif isinstance(problema_input, gp.Model):
             # Se for um objeto Model, nós o usamos diretamente.
-            logging.info("Carregando modelo Gurobi já existente.")
+            logging.debug("Carregando modelo Gurobi já existente.")
             self.model: gp.Model = problema_input
             self.model.setParam('OutputFlag', 0)
         else:
@@ -36,7 +36,7 @@ class Problema:
             if v.VType == GRB.INTEGER or v.VType == GRB.BINARY:
                 self.variaveis_inteiras_nomes.append(v.VarName)
         
-        logging.info(f"Problema '{self.nome}' carregado. Encontradas {len(self.model.getVars())} variáveis e {len(self.model.getConstrs())} restrições.")
+        logging.debug(f"Problema '{self.nome}' carregado. Encontradas {len(self.model.getVars())} variáveis e {len(self.model.getConstrs())} restrições.")
 
     def __repr__(self) -> str:
         return f"Problema(nome='{self.nome}')"

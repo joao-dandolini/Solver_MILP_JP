@@ -1,36 +1,32 @@
-# utils/logger_config.py
+# CÓDIGO NOVO E CORRIGIDO para utils/logger_config.py
 
 import logging
 import sys
 
 def setup_logger():
     """
-    Configura o logger principal para o projeto, direcionando a saída para o console.
+    Configura o logger principal para o projeto de forma flexível.
     """
-    # Define o formato da mensagem de log
     log_format = "[%(asctime)s] [%(levelname)-8s] [%(module)-15s] - %(message)s"
-    
-    # Pega o logger raiz
     logger = logging.getLogger()
     
-    # Define o nível mínimo de log a ser exibido (DEBUG é o mais detalhado)
-    logger.setLevel(logging.DEBUG)
+    # --- MUDANÇA 1 ---
+    # O comportamento PADRÃO do logger será mostrar mensagens INFO ou mais importantes.
+    # Este é o modo "limpo" que você geralmente vai querer.
+    logger.setLevel(logging.INFO)
     
-    # Evita adicionar múltiplos handlers se a função for chamada mais de uma vez
     if logger.hasHandlers():
         logger.handlers.clear()
         
-    # Cria um handler para enviar os logs para o console (stdout)
     handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.DEBUG)
     
-    # Cria um formatador com o formato que definimos
+    # --- MUDANÇA 2 ---
+    # O handler (o "carteiro") estará sempre pronto para o nível mais detalhado.
+    # Ele só mostrará o que o logger principal (o "chefe") permitir.
+    handler.setLevel(logging.DEBUG) 
+    
     formatter = logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S')
-    
-    # Adiciona o formatador ao handler
     handler.setFormatter(formatter)
-    
-    # Adiciona o handler ao logger
     logger.addHandler(handler)
     
     logging.info("Logger configurado com sucesso.")
