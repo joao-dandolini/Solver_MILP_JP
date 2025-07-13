@@ -83,15 +83,21 @@ def find_cover_cuts(
             if debug: print(f"[DEBUG]     - Adicionando '{item['var'].VarName}', peso atual do cover: {cover_weight:.2f}")
 
             if cover_weight > rhs_limit:
+                cover_vars_names = [v.VarName for v in cover_set]
                 rhs_cut = len(cover_set) - 1
-                cut_data = (list(cover_set), rhs_cut) # Usamos list() para copiar
-                generated_cuts_data.append(cut_data)
-                
-                # Log para o usuário ver
-                lhs_display = " + ".join([v.VarName for v in cover_set])
-                print(f"INFO: Cover Cut Gerado a partir da restrição {i}: {lhs_display} <= {rhs_cut}")
-                
-                cover_found = True
+
+                # --- SUGESTÃO: VERIFICAR VIOLAÇÃO ---
+                lhs_cut_value = sum(lp_solution.get(v_name, 0.0) for v_name in cover_vars_names)
+
+                if lhs_cut_value > rhs_cut + TOLERANCE:
+                    # Só adiciona o corte se ele for violado
+                    cut_data = (cover_vars_names, rhs_cut) # Agora retornamos nomes, não objetos
+                    generated_cuts_data.append(cut_data)
+
+                    lhs_display = " + ".join(cover_vars_names)
+                    print(f"INFO: Cover Cut VIOLADO Gerado: {lhs_display} <= {rhs_cut}")
+                # --- FIM DA SUGESTÃO ---
+
                 break # Sai para a próxima restrição
         
         if not cover_found and debug:

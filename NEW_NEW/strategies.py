@@ -15,7 +15,7 @@ class BranchingStrategy(ABC):
     Classe base abstrata (interface) para todas as estratégias de branching.
     """
     @abstractmethod
-    def select_variable(self, node: Node, model: gp.Model) -> Optional[str]:
+    def select_variable(self, node: Node, model: gp.Model, original_vars: Dict[str, str]) -> Optional[str]: # <--- ADICIONE original_vars
         """ Seleciona a melhor variável para o branching. """
         raise NotImplementedError
 
@@ -26,25 +26,32 @@ class BranchingStrategy(ABC):
         """
         pass # A implementação padrão continua não fazendo nada, apenas aceita o argumento.
 
-# ... (MostInfeasibleStrategy e StrongBranchingStrategy permanecem as mesmas) ...
 class MostInfeasibleStrategy(BranchingStrategy):
-    def select_variable(self, node: Node, model: gp.Model) -> Optional[str]:
-        # ... código inalterado ...
+    # A assinatura do método agora corresponde à interface
+    def select_variable(self, node: Node, model: gp.Model, original_vars: Dict[str, str]) -> Optional[str]:
         if not node.variable_values: return None
+        
         branching_variable = None
         max_infeasibility = -1.0
         TOLERANCE = 1e-6
+        
         for var_name, var_value in node.variable_values.items():
-            if abs(var_value - round(var_value)) > TOLERANCE:
-                infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
-                if infeasibility > max_infeasibility:
-                    max_infeasibility = infeasibility
-                    branching_variable = var_name
+            # --- A CORREÇÃO CRÍTICA ESTÁ AQUI ---
+            # Só consideramos ramificar em variáveis que NÃO são contínuas.
+            if original_vars.get(var_name, GRB.CONTINUOUS) != GRB.CONTINUOUS:
+                if abs(var_value - round(var_value)) > TOLERANCE:
+                    infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
+                    if infeasibility > max_infeasibility:
+                        max_infeasibility = infeasibility
+                        branching_variable = var_name
+                        
         return branching_variable
 
 class StrongBranchingStrategy(BranchingStrategy):
+
     def __init__(self, candidate_limit: int = 10):
         self.candidate_limit = candidate_limit
+
     def _solve_lookahead_lp(self, base_model: gp.Model, node_bounds: Dict, branch_var: str, val_to_branch: float, direction: str) -> float:
         # ... código inalterado ...
         temp_model = base_model.copy()
@@ -65,7 +72,8 @@ class StrongBranchingStrategy(BranchingStrategy):
         temp_model.optimize()
         if temp_model.Status == GRB.OPTIMAL: return temp_model.ObjVal
         return float('inf')
-    def select_variable(self, node: Node, model: gp.Model) -> Optional[str]:
+    
+    def select_variable(self, node: Node, model: gp.Model, original_vars: Dict[str, str]) -> Optional[str]:
         # ... código inalterado ...
         if not node.variable_values: return None
         TOLERANCE = 1e-6
@@ -89,8 +97,6 @@ class StrongBranchingStrategy(BranchingStrategy):
                 best_var = var_name
         return best_var
 
-# --- NOSSA NOVA ESTRATÉGIA INTELIGENTE ---
-
 class PseudoCostStrategy(StrongBranchingStrategy):
     """
     Implementa Reliability Branching usando Pseudo-custos.
@@ -108,68 +114,83 @@ class PseudoCostStrategy(StrongBranchingStrategy):
         self.pseudo_costs_sum_fractionality = {}
         self.pseudo_costs_reliability_count = {}
 
-    def select_variable(self, node: Node, model: gp.Model, debug: bool = False) -> Optional[str]:
-            # Verificação de segurança 1: Se o nó for inviável, não há o que fazer.
-            if node.lp_objective_value is None:
-                return None
-                
-            # Verificação de segurança 2: Se não houver valores de variáveis.
-            if not node.variable_values:
-                return None
-
-            # Passo 1: Filtra apenas as variáveis fracionárias para análise.
-            TOLERANCE = 1e-6
-            fractional_vars = {
-                k: v for k, v in node.variable_values.items() 
-                if self.original_vars.get(k) != GRB.CONTINUOUS and abs(v - round(v)) > TOLERANCE
-            }
-
-            if not fractional_vars:
-                return None # Nenhuma variável fracionária para ramificar.
-
-            # Passo 2: Pré-seleciona as candidatas mais promissoras com a heurística barata.
-            all_candidates = []
-            for var_name, var_value in fractional_vars.items():
-                infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
-                all_candidates.append({'name': var_name, 'value': var_value, 'score': infeasibility})
+    def select_variable(self, node: Node, model: gp.Model, original_vars: Dict[str, str]) -> Optional[str]:
+        print("\n[DEBUG-STRATEGY] >>> Dentro de PseudoCostStrategy.select_variable <<<")
+        if node.variable_values:
+            print(f"[DEBUG-STRATEGY] Nó recebido tem {len(node.variable_values)} valores de variáveis.")
+        else:
+            print("[DEBUG-STRATEGY] ERRO: Nó recebido sem valores de variáveis!")
+        # --- FIM DO NOVO PRINT ---
+        # Verificação de segurança 1: Se o nó for inviável, não há o que fazer.
+        if node.lp_objective_value is None:
+            return None
             
-            all_candidates.sort(key=lambda x: x['score'], reverse=True)
-            limited_candidates = all_candidates[:self.candidate_limit]
+        # Verificação de segurança 2: Se não houver valores de variáveis.
+        if not node.variable_values:
+            return None
 
-            # Passo 3: Calcula o score para as candidatas (usando strong ou pseudo-custo).
-            best_score = -1.0
-            best_var = None
+        # Passo 1: Filtra apenas as variáveis fracionárias para análise.
+        TOLERANCE = 1e-6
+        fractional_vars = {
+            k: v for k, v in node.variable_values.items() 
+            if self.original_vars.get(k) != GRB.CONTINUOUS and abs(v - round(v)) > TOLERANCE
+        }
 
-            for cand in limited_candidates:
-                var_name = cand['name']
-                var_value = cand['value']
-                reliability = self.pseudo_costs_reliability_count.get(var_name, 0)
+        # --- NOVO PRINT DE DEPURAÇÃO ---
+        print(f"[DEBUG-STRATEGY] Encontradas {len(fractional_vars)} variáveis fracionárias.")
+        if not fractional_vars and node.variable_values:
+            print("[DEBUG-STRATEGY] Nenhuma var fracionária encontrada! Amostra de 10 valores recebidos:")
+            for i, (k, v) in enumerate(node.variable_values.items()):
+                if i >= 10: break
+                print(f"  - Var '{k}': Valor={v:.6f} (Tipo Original: {self.original_vars.get(k)})")
+        # --- FIM DO NOVO PRINT ---
 
-                if reliability < self.reliability_threshold:
-                    # Usa strong branching para aprender
-                    obj_down = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'down')
-                    obj_up = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'up')
-                    score = min(obj_down, obj_up)
-                else:
-                    # Usa a estimativa de pseudo-custo
-                    frac = var_value - math.floor(var_value)
-                    pc_down_sum_deg = self.pseudo_costs_sum_degradation[var_name]['down']
-                    pc_down_sum_frac = self.pseudo_costs_sum_fractionality[var_name]['down']
-                    pc_up_sum_deg = self.pseudo_costs_sum_degradation[var_name]['up']
-                    pc_up_sum_frac = self.pseudo_costs_sum_fractionality[var_name]['up']
+        if not fractional_vars:
+            return None # Nenhuma variável fracionária para ramificar.
 
-                    pc_down = (pc_down_sum_deg / pc_down_sum_frac) if pc_down_sum_frac > TOLERANCE else 0
-                    pc_up = (pc_up_sum_deg / pc_up_sum_frac) if pc_up_sum_frac > TOLERANCE else 0
+        # Passo 2: Pré-seleciona as candidatas mais promissoras com a heurística barata.
+        all_candidates = []
+        for var_name, var_value in fractional_vars.items():
+            infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
+            all_candidates.append({'name': var_name, 'value': var_value, 'score': infeasibility})
+        
+        all_candidates.sort(key=lambda x: x['score'], reverse=True)
+        limited_candidates = all_candidates[:self.candidate_limit]
 
-                    estimated_obj_down = node.lp_objective_value + pc_down * frac
-                    estimated_obj_up = node.lp_objective_value + pc_up * (1 - frac)
-                    score = min(estimated_obj_down, estimated_obj_up)
+        # Passo 3: Calcula o score para as candidatas (usando strong ou pseudo-custo).
+        best_score = -1.0
+        best_var = None
 
-                if score > best_score:
-                    best_score = score
-                    best_var = var_name
-            
-            return best_var
+        for cand in limited_candidates:
+            var_name = cand['name']
+            var_value = cand['value']
+            reliability = self.pseudo_costs_reliability_count.get(var_name, 0)
+
+            if reliability < self.reliability_threshold:
+                # Usa strong branching para aprender
+                obj_down = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'down')
+                obj_up = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'up')
+                score = min(obj_down, obj_up)
+            else:
+                # Usa a estimativa de pseudo-custo
+                frac = var_value - math.floor(var_value)
+                pc_down_sum_deg = self.pseudo_costs_sum_degradation[var_name]['down']
+                pc_down_sum_frac = self.pseudo_costs_sum_fractionality[var_name]['down']
+                pc_up_sum_deg = self.pseudo_costs_sum_degradation[var_name]['up']
+                pc_up_sum_frac = self.pseudo_costs_sum_fractionality[var_name]['up']
+
+                pc_down = (pc_down_sum_deg / pc_down_sum_frac) if pc_down_sum_frac > TOLERANCE else 0
+                pc_up = (pc_up_sum_deg / pc_up_sum_frac) if pc_up_sum_frac > TOLERANCE else 0
+
+                estimated_obj_down = node.lp_objective_value + pc_down * frac
+                estimated_obj_up = node.lp_objective_value + pc_up * (1 - frac)
+                score = min(estimated_obj_down, estimated_obj_up)
+
+            if score > best_score:
+                best_score = score
+                best_var = var_name
+        
+        return best_var
 
     def update_scores(self, parent_node: Node, child_nodes: List[Node], branch_var: str):
             """
@@ -183,9 +204,10 @@ class PseudoCostStrategy(StrongBranchingStrategy):
             parent_val = parent_node.variable_values[branch_var]
             frac = parent_val - math.floor(parent_val)
 
+            TOLERANCE_DIV = 1e-9
             if branch_var not in self.pseudo_costs_sum_degradation:
                 self.pseudo_costs_sum_degradation[branch_var] = {'down': 0.0, 'up': 0.0}
-                self.pseudo_costs_sum_fractionality[branch_var] = {'down': 0.0, 'up': 0.0}
+                self.pseudo_costs_sum_fractionality[branch_var] = {'down': TOLERANCE_DIV, 'up': TOLERANCE_DIV}
                 self.pseudo_costs_reliability_count[branch_var] = 0
 
             # Verifica o ramo 'down' antes de fazer contas

@@ -23,13 +23,13 @@ class StatisticsLogger:
         self._log_frequency = log_frequency_seconds
 
     def _calculate_gap(self, incumbent: float, best_bound: float) -> float:
-        """
-        Calcula o gap de otimalidade de forma segura.
-        """
-        if incumbent is None or abs(incumbent) < 1e-9:
-            return float('inf')  # Gap é infinito se não há solução ou ela é próxima de zero
-        
-        return abs(incumbent - best_bound) / abs(incumbent)
+        if incumbent is None:
+            return float('inf')
+
+        # Adiciona uma pequena tolerância para estabilidade numérica
+        denominator = 1e-10 + abs(incumbent) 
+
+        return abs(incumbent - best_bound) / denominator
 
     def start_solver(self):
         """

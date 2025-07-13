@@ -76,7 +76,81 @@ def _propagation_based_rounding(model, original_vars, lp_solution, knapsack_cons
         unfixed_vars = [v for v in integer_vars if domains[v]['lb'] != domains[v]['ub']]
     return {v_name: val['lb'] for v_name, val in domains.items()}
 
-# Em heuristics.py
+def run_diving_heuristic(
+    model: gp.Model, 
+    original_vars: Dict[str, str],
+    max_dive_depth: int = 300
+) -> Optional[Dict[str, Any]]:
+    """
+    Executa uma heurística de Mergulho para tentar encontrar uma solução inteira.
+
+    A cada passo, escolhe a variável mais 'infeaseble', a fixa, e resolve o LP.
+
+    Args:
+        model: O modelo MILP original (não relaxado).
+        original_vars: Dicionário com os tipos de variáveis originais.
+        max_dive_depth: O número máximo de passos de fixação em um único mergulho.
+
+    Returns:
+        Um dicionário com uma solução viável, se encontrada.
+    """
+    print("-" * 60)
+    print("INFO: Iniciando Heurística de Mergulho (Diving)...")
+
+    work_model = model.copy()
+    work_model.setParam('OutputFlag', 0)
+    work_model.setParam(GRB.Param.Presolve, 0)
+    work_model.setParam(GRB.Param.Cuts, 0)
+    
+    # Relaxa o modelo de trabalho para a heurística
+    for v in work_model.getVars():
+        if original_vars.get(v.VarName) != GRB.CONTINUOUS:
+            v.VType = GRB.CONTINUOUS
+    work_model.update()
+    
+    original_objective = work_model.getObjective()
+    
+    # Loop principal do mergulho
+    for depth in range(max_dive_depth):
+        work_model.optimize()
+
+        # Se o LP se tornar inviável, o mergulho falhou.
+        if work_model.Status != GRB.OPTIMAL:
+            print("INFO: [Diving] LP tornou-se inviável durante o mergulho. Parando.")
+            return None
+
+        lp_solution = {v.VarName: v.X for v in work_model.getVars()}
+        
+        # Verifica se a solução atual já é inteira
+        TOLERANCE = 1e-6
+        fractional_vars = {
+            name: val for name, val in lp_solution.items()
+            if original_vars.get(name) != GRB.CONTINUOUS and abs(val - round(val)) > TOLERANCE
+        }
+
+        if not fractional_vars:
+            print("INFO: [Diving] SUCESSO! Solução inteira encontrada durante o mergulho.")
+            # Calcula o valor do objetivo original para a solução encontrada
+            obj_val = original_objective.getValue()
+            return {'solution': lp_solution, 'objective': obj_val}
+
+        # Se não for inteira, escolhe a próxima variável para fixar
+        # Usamos a lógica 'most_infeasible'
+        var_to_fix = max(
+            fractional_vars.keys(), 
+            key=lambda k: 0.5 - abs(fractional_vars[k] - math.floor(fractional_vars[k]) - 0.5)
+        )
+        
+        fix_value = round(fractional_vars[var_to_fix])
+        print(f"INFO: [Diving] Profundidade {depth+1}: Fixando '{var_to_fix}' = {fix_value}")
+
+        # Fixa a variável no modelo de trabalho para a próxima iteração
+        var_obj = work_model.getVarByName(var_to_fix)
+        var_obj.lb = fix_value
+        var_obj.ub = fix_value
+
+    print("INFO: [Diving] Profundidade máxima do mergulho atingida sem encontrar solução.")
+    return None
 
 def run_feasibility_pump(
     model: gp.Model, 
