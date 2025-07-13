@@ -19,14 +19,14 @@ def main():
     # 1. CONFIGURAÇÃO
     setup_logger()
     # Para ver mais detalhes do B&B, descomente a linha abaixo
-    logging.getLogger().setLevel(logging.DEBUG) 
+    #logging.getLogger().setLevel(logging.DEBUG) 
     
     logging.info("="*20 + " INICIANDO SOLVER MILP COMPLETO " + "="*20)
 
     # 2. LEITURA DO PROBLEMA
     try:
         # Definimos o caminho do arquivo que queremos resolver
-        opcao = 5
+        opcao = 2
         if opcao == 1:
             caminho_problema = "../tests/mas76.mps"
             sentido_desejado = GRB.MINIMIZE

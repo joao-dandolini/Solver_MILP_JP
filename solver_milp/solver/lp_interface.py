@@ -3,13 +3,15 @@
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
+import logging
 
 from .problem import Problema
 
 def solve_lp_gurobi(problema: Problema, 
-                   local_constraints: List[Tuple[str, str, float]], 
-                   general_cuts: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    local_constraints: List[Tuple[str, str, float]], 
+                    general_cuts: List[Dict[str, Any]] = None,
+                    warm_start_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Resolve a relaxação LP, com suporte para planos de corte gerais e retornando
     a informação da base do simplex.
@@ -37,6 +39,20 @@ def solve_lp_gurobi(problema: Problema,
                 
                 if sentido == ">=": model_copy.addConstr(expr >= rhs)
                 elif sentido == "<=": model_copy.addConstr(expr <= rhs)
+
+        # --- NOVO BLOCO DE WARM START ---
+        if warm_start_info:
+            try:
+                # O warm start só é possível se o número de variáveis e restrições não mudou.
+                # A adição de cortes gerais pode invalidar a base.
+                if len(warm_start_info['vbasis']) == len(model_copy.getVars()) and \
+                   len(warm_start_info['cbasis']) == len(model_copy.getConstrs()):
+                    model_copy.setAttr('VBasis', model_copy.getVars(), warm_start_info['vbasis'])
+                    model_copy.setAttr('CBasis', model_copy.getConstrs(), warm_start_info['cbasis'])
+                    logging.debug("Warm start aplicado ao LP.")
+            except gp.GurobiError as e:
+                logging.warning(f"Falha ao aplicar warm start: {e}. Resolvendo LP do zero.")
+        # --- FIM DO BLOCO ---
 
         model_copy.optimize()
 
