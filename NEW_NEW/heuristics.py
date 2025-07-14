@@ -76,31 +76,40 @@ def _propagation_based_rounding(model, original_vars, lp_solution, knapsack_cons
         unfixed_vars = [v for v in integer_vars if domains[v]['lb'] != domains[v]['ub']]
     return {v_name: val['lb'] for v_name, val in domains.items()}
 
+# Em heuristics.py
+
+def _solve_lookahead_lp(model: gp.Model, var_to_fix: str, fix_value: float) -> Optional[float]:
+    """Função auxiliar para testar um único branch durante o mergulho."""
+    temp_model = model.copy()
+    temp_model.setParam(GRB.Param.OutputFlag, 0)
+    
+    var_obj = temp_model.getVarByName(var_to_fix)
+    var_obj.lb = fix_value
+    var_obj.ub = fix_value
+    
+    temp_model.optimize()
+    
+    if temp_model.Status == GRB.OPTIMAL:
+        return temp_model.ObjVal
+    return None
+
 def run_diving_heuristic(
     model: gp.Model, 
     original_vars: Dict[str, str],
-    max_dive_depth: int = 300
+    max_dive_depth: int = 100 # Reduzimos a profundidade padrão para ser mais rápido
 ) -> Optional[Dict[str, Any]]:
     """
-    Executa uma heurística de Mergulho para tentar encontrar uma solução inteira.
-
-    A cada passo, escolhe a variável mais 'infeaseble', a fixa, e resolve o LP.
-
-    Args:
-        model: O modelo MILP original (não relaxado).
-        original_vars: Dicionário com os tipos de variáveis originais.
-        max_dive_depth: O número máximo de passos de fixação em um único mergulho.
-
-    Returns:
-        Um dicionário com uma solução viável, se encontrada.
+    Executa uma heurística de "Mergulho com Lookahead".
+    A cada passo, testa os ramos de 'subir' e 'descer' e escolhe o que
+    degrada menos a função objetivo.
     """
     print("-" * 60)
-    print("INFO: Iniciando Heurística de Mergulho (Diving)...")
+    print("INFO: Iniciando Heurística de Mergulho com Lookahead...")
 
     work_model = model.copy()
-    work_model.setParam('OutputFlag', 0)
     work_model.setParam(GRB.Param.Presolve, 0)
     work_model.setParam(GRB.Param.Cuts, 0)
+    work_model.setParam('OutputFlag', 0)
     
     # Relaxa o modelo de trabalho para a heurística
     for v in work_model.getVars():
@@ -108,48 +117,70 @@ def run_diving_heuristic(
             v.VType = GRB.CONTINUOUS
     work_model.update()
     
-    original_objective = work_model.getObjective()
+    original_objective = model.getObjective() # Pega o objetivo do modelo original
     
     # Loop principal do mergulho
     for depth in range(max_dive_depth):
         work_model.optimize()
 
-        # Se o LP se tornar inviável, o mergulho falhou.
         if work_model.Status != GRB.OPTIMAL:
-            print("INFO: [Diving] LP tornou-se inviável durante o mergulho. Parando.")
+            print("INFO: [Lookahead Dive] LP tornou-se inviável. Parando.")
             return None
 
         lp_solution = {v.VarName: v.X for v in work_model.getVars()}
         
-        # Verifica se a solução atual já é inteira
-        TOLERANCE = 1e-6
         fractional_vars = {
             name: val for name, val in lp_solution.items()
-            if original_vars.get(name) != GRB.CONTINUOUS and abs(val - round(val)) > TOLERANCE
+            if original_vars.get(name) != GRB.CONTINUOUS and abs(val - round(val)) > 1e-6
         }
 
         if not fractional_vars:
-            print("INFO: [Diving] SUCESSO! Solução inteira encontrada durante o mergulho.")
-            # Calcula o valor do objetivo original para a solução encontrada
-            obj_val = original_objective.getValue()
-            return {'solution': lp_solution, 'objective': obj_val}
+            print("INFO: [Lookahead Dive] SUCESSO! Solução inteira encontrada.")
+            final_solution = {v.VarName: v.X for v in work_model.getVars()}
+            # Pega o valor do objetivo diretamente do modelo que foi resolvido
+            obj_val = work_model.ObjVal # <-- CORREÇÃO
+            return {'solution': final_solution, 'objective': obj_val}
 
-        # Se não for inteira, escolhe a próxima variável para fixar
-        # Usamos a lógica 'most_infeasible'
-        var_to_fix = max(
+        # Seleciona a variável mais fracionária para analisar
+        var_to_fix_name = max(
             fractional_vars.keys(), 
             key=lambda k: 0.5 - abs(fractional_vars[k] - math.floor(fractional_vars[k]) - 0.5)
         )
         
-        fix_value = round(fractional_vars[var_to_fix])
-        print(f"INFO: [Diving] Profundidade {depth+1}: Fixando '{var_to_fix}' = {fix_value}")
+        var_value = fractional_vars[var_to_fix_name]
+        
+        # --- LÓGICA DO LOOKAHEAD ---
+        # Testa os dois caminhos: arredondar para baixo e para cima
+        obj_down = _solve_lookahead_lp(work_model, var_to_fix_name, math.floor(var_value))
+        obj_up = _solve_lookahead_lp(work_model, var_to_fix_name, math.ceil(var_value))
+        
+        # Escolhe o caminho que leva a uma solução melhor (ou menos pior)
+        # Para um problema de MIN, queremos o menor ObjVal. Para MAX, o maior.
+        is_minimization = model.ModelSense == GRB.MINIMIZE
+        
+        # Decide qual ramo é mais promissor
+        if obj_down is None and obj_up is None:
+            print(f"INFO: [Lookahead Dive] Ambos os ramos para '{var_to_fix_name}' são inviáveis. Parando.")
+            return None
+        
+        go_down = False
+        if obj_down is not None and obj_up is not None:
+            go_down = obj_down < obj_up if is_minimization else obj_down > obj_up
+        elif obj_down is not None:
+            go_down = True
+            
+        fix_value = math.floor(var_value) if go_down else math.ceil(var_value)
+        direction = "'baixo'" if go_down else "'cima'"
+        # --- FIM DA LÓGICA DO LOOKAHEAD ---
+
+        print(f"INFO: [Lookahead Dive] Profundidade {depth+1}: Fixando '{var_to_fix_name}' para {fix_value} (ramo mais promissor: {direction})")
 
         # Fixa a variável no modelo de trabalho para a próxima iteração
-        var_obj = work_model.getVarByName(var_to_fix)
+        var_obj = work_model.getVarByName(var_to_fix_name)
         var_obj.lb = fix_value
         var_obj.ub = fix_value
 
-    print("INFO: [Diving] Profundidade máxima do mergulho atingida sem encontrar solução.")
+    print("INFO: [Lookahead Dive] Profundidade máxima atingida.")
     return None
 
 def run_feasibility_pump(

@@ -4,12 +4,15 @@
 import argparse
 import sys
 from solver import MILPSolver
+import traceback
 
 # Defina seu arquivo de teste padrão aqui para facilitar a execução.
 # Altere este caminho para o local do seu arquivo .mps de teste principal.
 #DEFAULT_PROBLEM_PATH = "./tests/mas76.mps"
-DEFAULT_PROBLEM_PATH = "./tests/instance_0003.mps"
-#DEFAULT_PROBLEM_PATH = "./tests/Archive/model_S1_Jc0_Js9_T96.mps"
+#DEFAULT_PROBLEM_PATH = "./tests/instance_0003.mps"
+DEFAULT_PROBLEM_PATH = "./tests/Archive/model_S1_Jc0_Js9_T96.mps"
+
+#DEFAULT_PROBLEM_PATH = "./gomory_source.lp"
 
 def main():
     parser = argparse.ArgumentParser(
@@ -65,6 +68,20 @@ def main():
         help="Número de nós a serem explorados em modo DFS antes de trocar para Best-Bound."
     )
 
+    parser.add_argument(
+        "--cut-frequency",
+        type=int,
+        default=0, # Padrão 0 desliga a geração iterativa
+        help="Frequência de nós para tentar gerar cortes (ex: 100). 0 para desligar."
+    )
+ 
+    parser.add_argument(
+        "--cut-depth",
+        type=int,
+        default=5, # Padrão razoável
+        help="Profundidade máxima na árvore para tentar gerar cortes."
+    )
+
     args = parser.parse_args()
     
     # Lógica para usar um arquivo de teste padrão se nenhum for fornecido
@@ -83,7 +100,9 @@ def main():
         'use_heuristics': args.use_heuristics,
         'dfs_limit': args.dfs_limit,
         'rins_frequency': args.rins_freq,
-        'use_presolve': args.use_presolve # Adiciona a nova chave
+        'use_presolve': args.use_presolve,
+        'cut_frequency': args.cut_frequency,
+        'cut_depth': args.cut_depth 
     }
     solver = MILPSolver(config=solver_config)
     
@@ -94,6 +113,9 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"ERRO: Ocorreu um erro inesperado durante a execução: {e}", file=sys.stderr)
+        # --- ADICIONE ESTA LINHA PARA IMPRIMIR O TRACEBACK DETALHADO ---
+        traceback.print_exc()
+        # --- FIM DA ADIÇÃO ---
         sys.exit(1)
 
     print("--- Execução do Solver Concluída ---")

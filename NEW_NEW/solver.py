@@ -9,7 +9,7 @@ import math # Importado para o branching
 from tree_elements import Node, Tree
 from strategies import BranchingStrategy, MostInfeasibleStrategy, StrongBranchingStrategy, PseudoCostStrategy
 from utils import StatisticsLogger
-from cut_generator import find_cover_cuts
+from cut_generator import find_cover_cuts, find_gomory_cuts
 from heuristics import run_feasibility_pump, run_rins, run_diving_heuristic
 from presolve import run_presolve
 
@@ -35,6 +35,7 @@ class MILPSolver:
         self.node_count: int = 0
         self.lp_model_for_relaxations: Optional[gp.Model] = None
         self.tree: Tree = None
+        self.added_cuts_pool = set()
 
     def _get_branching_strategy(self) -> BranchingStrategy:
         """
@@ -85,44 +86,256 @@ class MILPSolver:
         else:
             node.set_lp_solution('INFEASIBLE', None, None, False)
 
+    def _run_root_node_strengthening_pass(self):
+        """
+        Executa uma única resolução do LP da raiz com os geradores de corte
+        internos do Gurobi ligados para obter um best_bound mais forte.
+        """
+        print("-" * 60)
+        print("INFO: [Root Node] Executando passada de fortalecimento com cortes Gurobi...")
+
+        # Criamos uma cópia do nosso modelo LP base para não alterar o original
+        strength_model = self.lp_model_for_relaxations.copy()
+
+        # Ligamos temporariamente os cortes do Gurobi de forma agressiva
+        strength_model.setParam(GRB.Param.Cuts, 2) # 2 = Agressivo
+        strength_model.setParam(GRB.Param.Gomory, 2) # 2 = Agressivo
+
+        # Se já tivermos uma solução (da heurística), podemos usar o Cutoff
+        # para ajudar o Gurobi a encontrar cortes mais eficazes.
+        if self.incumbent_value != float('inf'):
+            # Para um problema de MIN, qualquer solução acima do incumbente pode ser cortada.
+            strength_model.setParam(GRB.Param.Cutoff, self.incumbent_value)
+
+        strength_model.optimize()
+
+        # Verificamos se ele encontrou uma solução ótima
+        if strength_model.Status == GRB.OPTIMAL:
+            new_best_bound = strength_model.ObjVal
+            print(f"INFO: [Root Node] 'Best Bound' original: {self.best_bound:.4f}")
+            print(f"INFO: [Root Node] 'Best Bound' fortalecido: {new_best_bound:.4f}")
+            # Retornamos o novo e melhorado best bound
+            return new_best_bound
+        
+        # Se algo der errado, apenas retornamos o best_bound antigo
+        print("WARNING: [Root Node] Passada de fortalecimento não produziu um resultado ótimo.")
+        return self.best_bound
+
+    def _run_cut_generation_for_node(self, node: Node):
+            """
+            Executa uma rodada de geração de cortes para um nó específico,
+            buscando tanto Cover Cuts quanto Gomory Cuts.
+            Retorna True se algum corte foi adicionado, False caso contrário.
+            """
+            print(f"INFO: [Node {node.id}] Tentando gerar cortes...")
+            
+            # Cria um modelo LP específico para este nó, com seus limites de branching
+            node_lp_model = self._create_lp_for_node(node)
+            
+            cuts_added_this_round = 0
+            
+            # --- 1. LÓGICA PARA COVER CUTS ---
+            if node.variable_values:
+                cover_cut_recipes = find_cover_cuts(node_lp_model, node.variable_values, self.original_vars)
+                
+                for cut_vars, cut_rhs in cover_cut_recipes:
+                    cut_signature = (tuple(sorted(cut_vars)), '<=', cut_rhs)
+                    
+                    if cut_signature in self.added_cuts_pool:
+                        continue
+
+                    # --- LOG: ADICIONANDO O CORTE ---
+                    print(f"INFO: [Cuts] Adicionando Cover Cut ao modelo: {' + '.join(cut_vars)} <= {cut_rhs}")
+
+                    self.added_cuts_pool.add(cut_signature)
+                    
+                    expr_main = quicksum(self.model.getVarByName(v) for v in cut_vars)
+                    expr_lp = quicksum(self.lp_model_for_relaxations.getVarByName(v) for v in cut_vars)
+                    
+                    cut_name = f"cover_{len(self.added_cuts_pool)}"
+                    self.model.addConstr(expr_main <= cut_rhs, name=cut_name)
+                    self.lp_model_for_relaxations.addConstr(expr_lp <= cut_rhs, name=cut_name)
+                    cuts_added_this_round += 1
+
+            # --- 2. LÓGICA PARA GOMORY CUTS ---
+            gomory_cut_recipes = find_gomory_cuts(node_lp_model, self.original_vars)
+            if gomory_cut_recipes:
+                for coeffs, sense, rhs in gomory_cut_recipes:
+                    cut_signature_items = tuple(sorted(coeffs.items()))
+                    cut_signature = (cut_signature_items, sense, rhs)
+                    
+                    if cut_signature in self.added_cuts_pool:
+                        continue
+
+                    print(f"INFO: [Cuts] Gomory Cut encontrado para o Nó {node.id}.")
+                    self.added_cuts_pool.add(cut_signature)
+                    
+                    expr_main = gp.LinExpr()
+                    expr_lp = gp.LinExpr()
+                    for var_name, coeff_val in coeffs.items():
+                        expr_main.addTerms(coeff_val, self.model.getVarByName(var_name))
+                        expr_lp.addTerms(coeff_val, self.lp_model_for_relaxations.getVarByName(var_name))
+                    
+                    cut_name = f"gomory_{len(self.added_cuts_pool)}"
+                    if sense == GRB.GREATER_EQUAL:
+                        self.model.addConstr(expr_main >= rhs, name=cut_name)
+                        self.lp_model_for_relaxations.addConstr(expr_lp >= rhs, name=cut_name)
+                    elif sense == GRB.LESS_EQUAL:
+                        self.model.addConstr(expr_main <= rhs, name=cut_name)
+                        self.lp_model_for_relaxations.addConstr(expr_lp <= rhs, name=cut_name)
+                    else: # GRB.EQUAL
+                        self.model.addConstr(expr_main == rhs, name=cut_name)
+                        self.lp_model_for_relaxations.addConstr(expr_lp == rhs, name=cut_name)
+                    
+                    cuts_added_this_round += 1
+            
+            # --- FINALIZAÇÃO ---
+            if cuts_added_this_round > 0:
+                print(f"INFO: [Node {node.id}] {cuts_added_this_round} cortes novos adicionados no total.")
+                self.model.update()
+                self.lp_model_for_relaxations.update()
+                return True
+                
+            return False
+
+    def _create_lp_for_node(self, node: Node) -> gp.Model:
+            """
+            Cria uma cópia do modelo LP de relaxação e aplica os limites de
+            branching específicos de um determinado nó.
+            """
+            # Cria uma cópia fresca do modelo LP da raiz
+            node_lp_model = self.lp_model_for_relaxations.copy()
+            
+            # Aplica as restrições de branching deste nó
+            for var_name, bound_info in node.local_bounds.items():
+                var = node_lp_model.getVarByName(var_name)
+                if bound_info['type'] == 'LOWER':
+                    var.lb = max(var.lb, bound_info['value'])
+                else: # UPPER
+                    var.ub = min(var.ub, bound_info['value'])
+            
+            node_lp_model.update()
+            return node_lp_model
+
+    def _run_local_cut_and_solve(self, node: Node):
+            """
+            Cria um LP temporário para o nó, fortalece-o com cortes locais em um loop,
+            e usa o resultado para obter um limitante dual mais forte para o nó.
+            NÃO modifica os modelos globais.
+            """
+            print(f"INFO: [Node {node.id}] Tentando gerar cortes LOCAIS para apertar o limitante...")
+            
+            # 1. Cria e resolve o LP do nó pela primeira vez para obter um ponto de partida
+            local_lp = self._create_lp_for_node(node)
+            local_lp.setParam(GRB.Param.OutputFlag, 0)
+            local_lp.optimize()
+            
+            # Se não houver uma solução ótima para começar, não há o que fazer.
+            if local_lp.Status != GRB.OPTIMAL:
+                print(f"AVISO: [Node {node.id}] LP local inicial não é ótimo. Abortando cortes para este nó.")
+                return
+
+            original_node_bound = local_lp.ObjVal
+
+            # 2. Inicia o loop de geração e adição de cortes
+            MAX_LOCAL_CUT_ROUNDS = 5
+            total_cuts_added_in_session = 0
+
+            for i in range(MAX_LOCAL_CUT_ROUNDS):
+                # Agora é seguro pegar a solução, pois o modelo foi resolvido
+                current_lp_solution = {v.VarName: v.X for v in local_lp.getVars()}
+                
+                cuts_in_this_round = 0
+
+                # 3. Adiciona os Cover Cuts encontrados
+                cover_recipes = find_cover_cuts(local_lp, current_lp_solution, self.original_vars)
+                for cut_vars, cut_rhs in cover_recipes:
+                    cut_signature = (tuple(sorted(cut_vars)), '<=', cut_rhs)
+                    if cut_signature not in self.added_cuts_pool:
+                        self.added_cuts_pool.add(cut_signature)
+                        expr = quicksum(local_lp.getVarByName(v) for v in cut_vars)
+                        local_lp.addConstr(expr <= cut_rhs)
+                        cuts_in_this_round += 1
+
+                # 4. Adiciona os Gomory Cuts encontrados
+                gomory_recipes = find_gomory_cuts(local_lp, self.original_vars)
+                for coeffs, sense, rhs in gomory_recipes:
+                    cut_signature = (tuple(sorted(coeffs.items())), sense, rhs)
+                    if cut_signature not in self.added_cuts_pool:
+                        self.added_cuts_pool.add(cut_signature)
+                        expr = gp.LinExpr()
+                        for var_name, coeff in coeffs.items():
+                            expr.addTerms(coeff, local_lp.getVarByName(var_name))
+                        
+                        if sense == GRB.GREATER_EQUAL: local_lp.addConstr(expr >= rhs)
+                        elif sense == GRB.LESS_EQUAL: local_lp.addConstr(expr <= rhs)
+                        else: local_lp.addConstr(expr == rhs)
+                        cuts_in_this_round += 1
+                
+                # 5. Verifica se o loop deve continuar
+                if cuts_in_this_round == 0:
+                    print(f"INFO: [Node {node.id}] Nenhuma fonte de corte nova encontrada na rodada {i+1}.")
+                    break # Encerra o loop de cortes para este nó
+
+                total_cuts_added_in_session += cuts_in_this_round
+                print(f"INFO: [Node {node.id}] Rodada {i+1}: {cuts_in_this_round} cortes adicionados ao LP local. Re-resolvendo...")
+                
+                # Re-resolve o LP local, agora mais forte
+                local_lp.update()
+                local_lp.optimize()
+
+                if local_lp.Status != GRB.OPTIMAL:
+                    print(f"AVISO: [Node {node.id}] LP local tornou-se inviável após adição de cortes.")
+                    break # Encerra se adicionar cortes quebrou o LP
+
+            # 6. Após o loop, atualiza o limitante do nó principal se ele realmente melhorou
+            if total_cuts_added_in_session > 0 and local_lp.Status == GRB.OPTIMAL:
+                new_bound = local_lp.ObjVal
+                is_minimization = self.model_sense == GRB.MINIMIZE
+                
+                # Verifica se o novo bound é realmente uma melhoria (considerando tolerâncias)
+                if (is_minimization and new_bound > original_node_bound + 1e-6) or \
+                (not is_minimization and new_bound < original_node_bound - 1e-6):
+                    print(f"INFO: [Node {node.id}] Limitante dual melhorado com cortes locais: {original_node_bound:.4f} -> {new_bound:.4f}")
+                    node.lp_objective_value = new_bound
+
     def solve(self, problem_path: str):
         """
-        Ponto de entrada principal para resolver um problema MILP, com a lógica final e correta.
+        Ponto de entrada principal para resolver um problema MILP, com a arquitetura
+        correta de geração de cortes globais e locais.
         """
+        # --- 1. SETUP INICIAL ---
         self.logger.start_solver()
         self.model = gp.read(problem_path)
         self.original_milp_model = self.model.copy()
-        self.model.setParam(GRB.Param.OutputFlag, 0)   # Já tínhamos, mas é bom manter aqui
-        self.model.setParam(GRB.Param.Presolve, 0)      # Desliga o pré-processamento do modelo
-        self.model.setParam(GRB.Param.Cuts, 0)          # Desliga todos os geradores de cortes automáticos
-        self.model.setParam(GRB.Param.Heuristics, 0)    # Desliga todas as heurísticas automáticas (FP, RINS, etc.)
-        self.model.setParam(GRB.Param.Symmetry, 0) 
+        
+        # Desliga as funcionalidades automáticas do Gurobi
+        self.model.setParam(GRB.Param.OutputFlag, 0)
+        self.model.setParam(GRB.Param.Presolve, 0)
+        self.model.setParam(GRB.Param.Cuts, 0)
+        self.model.setParam(GRB.Param.Heuristics, 0)
         
         self.original_vars = {v.VarName: v.VType for v in self.model.getVars()}
-
         self.branching_strategy = self._get_branching_strategy()
-
-        # --- ALTERAÇÃO 1: DETECTAR O SENTIDO E AJUSTAR OS LIMITES ---
-        # Detectamos se o problema é de MIN ou MAX e ajustamos o incumbente inicial.
+        
         self.model_sense = self.model.ModelSense
-        print(f"[DEBUG-Sense] Gurobi reporta ModelSense: {self.model_sense} (Onde MIN={GRB.MINIMIZE} e MAX={GRB.MAXIMIZE})")
         if self.model_sense == GRB.MAXIMIZE:
             self.incumbent_value = -float('inf')
             self.best_bound = float('inf')
             print("INFO: Problema de MAXIMIZAÇÃO detectado.")
         else: # GRB.MINIMIZE
-            # Os valores padrão do __init__ já são para minimização.
+            self.incumbent_value = float('inf')
+            self.best_bound = -float('inf')
             print("INFO: Problema de MINIMIZAÇÃO detectado.")
-        # --- FIM DA ALTERAÇÃO 1 ---
             
+        # --- 2. PRESOLVE (OPCIONAL) ---
         if self.config.get('use_presolve', False):
             run_presolve(self.model, self.original_vars)
-            # É uma boa prática chamar update() após modificar o modelo
-            self.model.update() 
-            print("INFO: [Solver] Atualizando o dicionário de variáveis pós-presolve.")
+            self.model.update()
             self.original_vars = {v.VarName: v.VType for v in self.model.getVars()}
             self.original_milp_model = self.model.copy()
 
+        # --- 3. CRIAÇÃO DO MODELO LP BASE ---
         print("INFO: Criando modelo de relaxação LP para o B&B...")
         self.lp_model_for_relaxations = self.model.copy()
         for v in self.lp_model_for_relaxations.getVars():
@@ -130,76 +343,37 @@ class MILPSolver:
                 v.VType = GRB.CONTINUOUS
         self.lp_model_for_relaxations.update()
 
+        # --- 4. HEURÍSTICA INICIAL (OPCIONAL) ---
         if self.config.get('use_heuristics', False):
-            # A chamada agora usa nossa nova e mais rápida heurística de mergulho
-            heuristic_result = run_diving_heuristic(self.original_milp_model, self.original_vars)
+            # A chamada agora é direta e mais simples
+            heuristic_result = run_diving_heuristic(
+                self.original_milp_model, 
+                self.original_vars
+            )
+            
             if heuristic_result:
                 self.incumbent_value = heuristic_result['objective']
                 self.incumbent_solution = heuristic_result['solution']
-                print(f"INFO: [Solver] Heurística de Mergulho encontrou solução viável com objetivo: {self.incumbent_value:.4f}")
+                print(f"INFO: [Solver] Heurística inteligente encontrou solução: {self.incumbent_value:.4f}")
                 self.logger.log_event(0, self.incumbent_value, self.best_bound, force_log=True)
-                
-        # Em solve()
+
+        # --- 5. RESOLUÇÃO E PREPARAÇÃO DA RAIZ ---
         root_node = Node(parent_id=None, depth=0, local_bounds={})
-        # Passe o modelo LP como o segundo argumento
         self._solve_lp_relaxation(root_node, self.lp_model_for_relaxations)
-
-
-        if self.config.get('use_cuts', False):
-            # --- NOVO: LOOP DE GERAÇÃO DE CORTES NA RAIZ (COM VERIFICAÇÃO DE DUPLICATAS) ---
-            MAX_CUT_ROUNDS = 10
-            print("-" * 60)
-            print("INFO: Iniciando fase de geração de cortes no nó raiz...")
-            
-            # 1. INICIALIZAMOS NOSSO "POOL" DE CORTES
-            added_cuts_pool = set()
-            
-            for i in range(MAX_CUT_ROUNDS):
-                if root_node.is_integer:
-                    print("INFO: Solução da raiz tornou-se inteira. Parando a geração de cortes.")
-                    break
-
-                new_cuts_data = find_cover_cuts(self.model, root_node.variable_values, self.original_vars, debug=True)
-
-                if not new_cuts_data:
-                    print("INFO: Nenhum novo Cover Cut encontrado. Finalizando a geração de cortes.")
-                    break
-                
-                cuts_added_this_round = 0
-                for cut_vars, cut_rhs in new_cuts_data:
-                    
-                    # 2. CRIAMOS UMA "ASSINATURA" ÚNICA PARA O CORTE
-                    cut_signature = (tuple(sorted(cut_vars)), cut_rhs)
-
-                    # 3. VERIFICAMOS SE O CORTE JÁ ESTÁ NO NOSSO POOL
-                    if cut_signature not in added_cuts_pool:
-                        # Se for novo, adicionamos ao modelo e ao pool
-                        gurobi_vars = [self.model.getVarByName(v_name) for v_name in cut_vars]
-                        # Usamos o tamanho do pool para garantir um nome único
-                        cut_name = f"cover_cut_{len(added_cuts_pool)}" 
-                        self.model.addConstr(quicksum(gurobi_vars) <= cut_rhs, name=cut_name)
-                        
-                        added_cuts_pool.add(cut_signature)
-                        cuts_added_this_round += 1
-                
-                # 4. SE NÃO ADICIONAMOS NENHUM CORTE NOVO, PARAMOS
-                if cuts_added_this_round == 0:
-                    print("INFO: Nenhum corte NOVO encontrado nesta rodada. Finalizando a geração de cortes.")
-                    break
-
-                self.model.update()
-                self._solve_lp_relaxation(root_node, self.lp_model_for_relaxations)
-                print(f"INFO: Rodada {i+1} - Cortes novos adicionados: {cuts_added_this_round}. 'Best Bound' da raiz atualizado para: {root_node.lp_objective_value:.4f}")
-
-            print("-" * 60)
-            # --- FIM DO LOOP DE CORTES ---
-            
         if root_node.lp_status == 'INFEASIBLE':
             self.logger.log_summary('Infeasible', 0, None, None)
             return
-
-        # FASE 3: SETUP E LOOP PRINCIPAL DO BRANCH AND BOUND
         self.best_bound = root_node.lp_objective_value
+
+        # --- 6. GERAÇÃO DE CORTES GLOBAIS (APENAS NA RAIZ, OPCIONAL) ---
+        if self.config.get('use_cuts', False):
+            print("-" * 60)
+            print("INFO: Iniciando fase de geração de cortes GLOBAIS no nó raiz...")
+            if self._run_cut_generation_for_node(root_node):
+                self._solve_lp_relaxation(root_node, self.lp_model_for_relaxations)
+                self.best_bound = root_node.lp_objective_value
+            print("-" * 60)
+            
         self.tree = Tree(root_node)
         #self.node_count = 0 # Inicializamos o contador aqui, antes do loop
 
@@ -211,18 +385,20 @@ class MILPSolver:
 
         while not self.tree.is_empty():
             self.node_count += 1
-            # --- NOVO BLOCO DE DEPURAÇÃO DA TROCA ---
-            #print(f"[DEBUG-Switch] Checando: Modo='{self.tree.mode}', "
-            #      f"Contagem={self.node_count}, Limite={self.dfs_node_limit}. "
-            #      f"Condição de troca: {self.tree.mode == 'DFS' and self.node_count > self.dfs_node_limit}")
-            # --- FIM DO BLOCO DE DEPURAÇÃO ---
-
             if self.tree.mode == 'DFS' and self.node_count > self.dfs_node_limit:
                 self.tree.switch_to_best_bound_mode()
 
-            # O resto do loop continua como antes...
             current_node = self.tree.get_next_node()
-            #print(f"[DEBUG-Busca] Processando Nó ID: {current_node.id}, ...")
+
+            # --- 8. GERAÇÃO DE CORTES LOCAIS (ITERATIVO, OPCIONAL) ---
+            cut_freq = self.config.get('cut_frequency', 0)
+            max_cut_depth = self.config.get('cut_depth', 5)
+
+            if self.config.get('use_cuts', False) and cut_freq > 0 and \
+               (self.node_count % cut_freq == 0) and (current_node.depth > 0) and \
+               (current_node.depth <= max_cut_depth):
+                
+                self._run_local_cut_and_solve(current_node)
 
             # --- GATILHO DA HEURÍSTICA RINS ---
             if self.rins_frequency > 0 and self.incumbent_solution is not None and (self.node_count % self.rins_frequency == 0):
