@@ -1,229 +1,152 @@
-# presolve.py
-# Contém as rotinas de pré-processamento para simplificar o modelo.
+# presolve.py (Versão Final, baseada no código de referência funcional)
 
-from typing import Dict, Any, List
 import gurobipy as gp
 from gurobipy import GRB
 import math
+from typing import Dict, List
 
-def _strengthen_bounds(model: gp.Model, original_vars: Dict[str, str]) -> int:
-    """
-    Executa UMA rodada de Fortalecimento de Limites no modelo.
-    Técnica descrita na Seção 3.1 do artigo 'Presolve Reductions in MIP'.
-    """
-    bounds_changed_this_iteration = 0
-    TOLERANCE = 1e-7
-
+# --- TÉCNICA 1: FIXAR VARIÁVEIS DE RESTRIÇÕES "SINGLETON" ---
+def _fix_from_singletons(model: gp.Model) -> int:
+    """Aperta os bounds usando restrições com apenas uma variável."""
+    changes = 0
+    constrs_to_remove = []
     for constr in model.getConstrs():
-        if constr.Sense not in [GRB.LESS_EQUAL, GRB.GREATER_EQUAL]:
-            continue
-
-        lhs_expr = model.getRow(constr)
-        rhs = constr.RHS
+        if model.getRow(constr).size() != 1: continue
         
-        min_activity, max_activity = 0.0, 0.0
-        for i in range(lhs_expr.size()):
-            var = lhs_expr.getVar(i)
-            coeff = lhs_expr.getCoeff(i)
-            if coeff > 0:
-                min_activity += coeff * var.LB
-                max_activity += coeff * var.UB
-            else:
-                min_activity += coeff * var.UB
-                max_activity += coeff * var.LB
+        row = model.getRow(constr)
+        var, coeff, rhs, sense = row.getVar(0), row.getCoeff(0), constr.RHS, constr.Sense
         
-        for i in range(lhs_expr.size()):
-            var = lhs_expr.getVar(i)
-            coeff = lhs_expr.getCoeff(i)
+        if abs(coeff) < 1e-9: continue
+        constrs_to_remove.append(constr)
+        implied_val = rhs / coeff
+        
+        try:
+            if sense == GRB.LESS_EQUAL:
+                if coeff > 0:
+                    if implied_val < var.UB: var.UB = implied_val; changes += 1
+                else:
+                    if implied_val > var.LB: var.LB = implied_val; changes += 1
+            elif sense == GRB.GREATER_EQUAL:
+                if coeff > 0:
+                    if implied_val > var.LB: var.LB = implied_val; changes += 1
+                else:
+                    if implied_val < var.UB: var.UB = implied_val; changes += 1
+            elif sense == GRB.EQUAL:
+                if var.LB != implied_val or var.UB != implied_val:
+                    var.LB = implied_val; var.UB = implied_val; changes += 1
+        except gp.GurobiError:
+            return -1 # Inviabilidade
             
-            if abs(coeff) < TOLERANCE: continue
+    for constr in constrs_to_remove: model.remove(constr)
+    return changes
 
-            if constr.Sense == GRB.LESS_EQUAL:
-                folga = rhs - (min_activity - coeff * (var.LB if coeff > 0 else var.UB))
-                if coeff > 0 and (new_bound := folga / coeff) < var.UB - TOLERANCE:
-                    var.UB = math.floor(new_bound) if original_vars[var.VarName] != GRB.CONTINUOUS else new_bound
-                    bounds_changed_this_iteration += 1
-                elif coeff < 0 and (new_bound := folga / coeff) > var.LB + TOLERANCE:
-                    var.LB = math.ceil(new_bound) if original_vars[var.VarName] != GRB.CONTINUOUS else new_bound
-                    bounds_changed_this_iteration += 1
+# --- TÉCNICA 2: PROPAGAÇÃO DE BOUNDS ---
+def _propagate_bounds(model: gp.Model, original_vars: Dict[str, str]) -> int:
+    """Itera sobre as restrições para apertar os limites das variáveis."""
+    tightenings = 0
+    TOLERANCE = 1e-7
+    for constr in tuple(model.getConstrs()):
+        row = model.getRow(constr)
+        if row.size() < 2: continue
+        rhs, sense = constr.RHS, constr.Sense
+        for i in range(row.size()):
+            var_i = row.getVar(i)
+            if var_i.LB > var_i.UB - TOLERANCE: continue
+            coeff_i = row.getCoeff(i)
+            if abs(coeff_i) < TOLERANCE: continue
             
-            elif constr.Sense == GRB.GREATER_EQUAL:
-                folga = (max_activity - coeff * (var.UB if coeff > 0 else var.LB)) - rhs
-                if coeff > 0 and (new_bound := -folga / coeff) > var.LB + TOLERANCE:
-                    var.LB = math.ceil(new_bound) if original_vars[var.VarName] != GRB.CONTINUOUS else new_bound
-                    bounds_changed_this_iteration += 1
-                elif coeff < 0 and (new_bound := -folga / coeff) < var.UB - TOLERANCE:
-                    var.UB = math.floor(new_bound) if original_vars[var.VarName] != GRB.CONTINUOUS else new_bound
-                    bounds_changed_this_iteration += 1
-                    
-    if bounds_changed_this_iteration > 0:
-        print(f"INFO: [Presolve-BS] Rodada de fortalecimento de limites apertou {bounds_changed_this_iteration} limites.")
+            activity_rest_min, activity_rest_max = 0.0, 0.0
+            for j in range(row.size()):
+                if i == j: continue
+                var_j, coeff_j = row.getVar(j), row.getCoeff(j)
+                if (coeff_j > 0 and var_j.LB == -GRB.INFINITY) or (coeff_j < 0 and var_j.UB == GRB.INFINITY): activity_rest_min = -GRB.INFINITY
+                if (coeff_j > 0 and var_j.UB == GRB.INFINITY) or (coeff_j < 0 and var_j.LB == -GRB.INFINITY): activity_rest_max = GRB.INFINITY
+                if activity_rest_min != -GRB.INFINITY: activity_rest_min += coeff_j * var_j.LB if coeff_j > 0 else coeff_j * var_j.UB
+                if activity_rest_max != GRB.INFINITY: activity_rest_max += coeff_j * var_j.UB if coeff_j > 0 else coeff_j * var_j.LB
+            
+            new_ub = var_i.UB
+            if sense in [GRB.LESS_EQUAL, GRB.EQUAL] and coeff_i > 0 and activity_rest_min > -GRB.INFINITY: new_ub = min(new_ub, (rhs - activity_rest_min) / coeff_i)
+            elif sense in [GRB.GREATER_EQUAL, GRB.EQUAL] and coeff_i < 0 and activity_rest_max < GRB.INFINITY: new_ub = min(new_ub, (rhs - activity_rest_max) / coeff_i)
+            if new_ub < var_i.UB - TOLERANCE:
+                final_ub = math.floor(new_ub + TOLERANCE) if original_vars.get(var_i.VarName) != GRB.CONTINUOUS else new_ub
+                if final_ub < var_i.LB - TOLERANCE: return -1
+                var_i.UB = final_ub
+                tightenings += 1
 
-    return bounds_changed_this_iteration
+            new_lb = var_i.LB
+            if sense in [GRB.GREATER_EQUAL, GRB.EQUAL] and coeff_i > 0 and activity_rest_max < GRB.INFINITY: new_lb = max(new_lb, (rhs - activity_rest_max) / coeff_i)
+            elif sense in [GRB.LESS_EQUAL, GRB.EQUAL] and coeff_i < 0 and activity_rest_min > -GRB.INFINITY: new_lb = max(new_lb, (rhs - activity_rest_min) / coeff_i)
+            if new_lb > var_i.LB + TOLERANCE:
+                final_lb = math.ceil(new_lb - TOLERANCE) if original_vars.get(var_i.VarName) != GRB.CONTINUOUS else new_lb
+                if final_lb > var_i.UB + TOLERANCE: return -1
+                var_i.LB = final_lb
+                tightenings += 1
+            
+            if var_i.LB > var_i.UB + TOLERANCE: return -1
+    return tightenings
 
-def _remove_redundant_constraints(model: gp.Model) -> int:
-    """Encontra e remove restrições redundantes do modelo."""
-    constraints_to_remove = [
-        c for c in model.getConstrs() if not c.ConstrName.startswith("cover_cut") and _is_constraint_redundant(model, c)
-    ]
-    if constraints_to_remove:
-        print(f"INFO: [Presolve-Redundant] Removendo {len(constraints_to_remove)} restrições redundantes.")
-        for constr in constraints_to_remove:
-            model.remove(constr)
-    return len(constraints_to_remove)
+# --- TÉCNICA 3: PROBING SEGURO ---
+def _probe_binary_variables(model: gp.Model, original_vars: Dict[str, str]) -> int:
+    """Executa probing em variáveis binárias, coletando e aplicando as mudanças no final."""
+    changes = 0
+    binary_vars = [v for v in model.getVars() if original_vars.get(v.VarName) == GRB.BINARY and v.LB != v.UB]
+    if not binary_vars: return 0
 
-def _is_constraint_redundant(model: gp.Model, constr: gp.Constr) -> bool:
-    """Verifica se uma única restrição é redundante."""
-    lhs_expr = model.getRow(constr)
-    rhs = constr.RHS
-    min_activity, max_activity = 0.0, 0.0
-    for i in range(lhs_expr.size()):
-        var, coeff = lhs_expr.getVar(i), lhs_expr.getCoeff(i)
-        if coeff > 0:
-            min_activity += coeff * var.LB
-            max_activity += coeff * var.UB
-        else:
-            min_activity += coeff * var.UB
-            max_activity += coeff * var.LB
+    print(f"INFO: [Presolve-Probing] Sondando {len(binary_vars)} variáveis binárias...")
     
-    if constr.Sense == GRB.LESS_EQUAL and max_activity <= rhs + 1e-6: return True
-    if constr.Sense == GRB.GREATER_EQUAL and min_activity >= rhs - 1e-6: return True
-    return False
+    vars_to_fix_to_0, vars_to_fix_to_1 = [], []
+    probe_model = None
+    try:
+        probe_model = model.copy()
+        probe_model.setParam('OutputFlag', 0)
+        probe_model.setParam('TimeLimit', 1)
 
-def _substitute_fixed_variables(model: gp.Model) -> int:
-    """
-    [CORRIGIDO] Encontra variáveis fixadas (lb=ub), substitui seus valores
-    nas restrições e as REMOVE do modelo para evitar loops infinitos.
-    Técnica descrita na Seção 4.1 do artigo 'Presolve Reductions in MIP'.
-    """
-    # Usamos uma list comprehension para encontrar todas as variáveis fixadas de uma vez
-    vars_to_substitute = [var for var in model.getVars() if var.LB == var.UB]
-    
-    if not vars_to_substitute:
-        return 0
-
-    print(f"INFO: [Presolve-Fixed] Substituindo e removendo {len(vars_to_substitute)} variáveis fixadas.")
-
-    # Iteramos sobre a lista de variáveis a serem substituídas
-    for var in vars_to_substitute:
-        fixed_value = var.LB
-        
-        # Obtém a coluna para ver onde a variável é usada
-        col = model.getCol(var)
-        
-        # Itera sobre as restrições onde a variável aparece
-        for i in range(col.size()):
-            constr = col.getConstr(i)
-            coeff = col.getCoeff(i)
+        for var in binary_vars:
+            p_var = probe_model.getVarByName(var.VarName)
             
-            # Remove a variável da restrição (muda o coeficiente para 0)
-            model.chgCoeff(constr, var, 0.0)
+            original_lb, original_ub = p_var.LB, p_var.UB
             
-            # Atualiza o RHS da restrição: b' = b - a_j * x_j
-            constr.RHS -= coeff * fixed_value
-            
-        # O PASSO QUE FALTAVA: Remove a variável do modelo por completo
-        model.remove(var)
+            p_var.LB = 1.0
+            probe_model.optimize()
+            if probe_model.Status == GRB.INFEASIBLE: vars_to_fix_to_0.append(var.VarName)
+            p_var.LB = original_lb
 
-    return len(vars_to_substitute)
+            if var.VarName not in vars_to_fix_to_0:
+                p_var.UB = 0.0
+                probe_model.optimize()
+                if probe_model.Status == GRB.INFEASIBLE: vars_to_fix_to_1.append(var.VarName)
+                p_var.UB = original_ub
+    finally:
+        if probe_model: probe_model.dispose()
 
-def _run_probing(model: gp.Model, original_vars: Dict[str, str]) -> int:
-    """
-    Executa UMA rodada de Probing em todas as variáveis binárias.
-    Técnica descrita na Seção 7.2 do artigo 'Presolve Reductions in MIP'.
-    """
-    variables_fixed = 0
-    
-    # Seleciona as variáveis binárias que ainda não estão fixas
-    binary_vars_to_probe = [
-        var for var in model.getVars() 
-        if original_vars.get(var.VarName) == GRB.BINARY and var.LB != var.UB
-    ]
-    
-    print(f"INFO: [Presolve-Probing] Sondando {len(binary_vars_to_probe)} variáveis binárias...")
+    for var_name in vars_to_fix_to_0:
+        var_obj = model.getVarByName(var_name)
+        if var_obj.UB != 0.0: var_obj.UB = 0.0; changes += 1
+    for var_name in vars_to_fix_to_1:
+        var_obj = model.getVarByName(var_name)
+        if var_obj.LB != 1.0: var_obj.LB = 1.0; changes += 1
+    return changes
 
-    for var in binary_vars_to_probe:
-        # Se a variável foi fixada por uma sondagem anterior, pule-a
-        if var.LB == var.UB:
-            continue
+# --- ORQUESTRADOR PRINCIPAL ---
 
-        # --- Teste 1: O que acontece se var = 0? ---
-        probe_model_0 = model.copy()
-        probe_model_0.setParam('OutputFlag', 0)
-        probe_var_0 = probe_model_0.getVarByName(var.VarName)
-        probe_var_0.UB = 0.0
-
-        # --- ALTERAÇÃO AQUI ---
-        # Em vez de apenas propagar bounds, resolvemos o LP para detectar inviabilidade.
-        # Isso é um uso permitido do nosso "oráculo LP".
-        probe_model_0.optimize() 
-
-        # Agora a checagem de status funcionará corretamente.
-        if probe_model_0.Status == GRB.INFEASIBLE:
-            print(f"INFO: [Presolve-Probing] Probing em '{var.VarName}=0' provou inviabilidade. Fixando '{var.VarName}=1'.")
-            var.LB = 1.0 # Fixa a variável no modelo ORIGINAL
-            model.update() # Aplica a fixação para a próxima sondagem
-            variables_fixed += 1
-            continue
-
-        # --- Teste 2: O que acontece se var = 1? ---
-        probe_model_1 = model.copy()
-        probe_model_1.setParam('OutputFlag', 0)
-        probe_var_1 = probe_model_1.getVarByName(var.VarName)
-        probe_var_1.LB = 1.0
-
-        # --- ALTERAÇÃO AQUI ---
-        probe_model_1.optimize()
-
-        if probe_model_1.Status == GRB.INFEASIBLE:
-            print(f"INFO: [Presolve-Probing] Probing em '{var.VarName}=1' provou inviabilidade. Fixando '{var.VarName}=0'.")
-            var.UB = 0.0 # Fixa a variável no modelo ORIGINAL
-            model.update() # Aplica a fixação
-            variables_fixed += 1
-
-        # --- Teste 2: O que acontece se var = 1? ---
-        probe_model_1 = model.copy()
-        probe_model_1.setParam('OutputFlag', 0)
-        probe_var_1 = probe_model_1.getVarByName(var.VarName)
-        probe_var_1.LB = 1.01
-        
-        _strengthen_bounds(probe_model_1, original_vars)
-        
-        if probe_model_1.Status == GRB.INFEASIBLE:
-            print(f"INFO: [Presolve-Probing] Probing em '{var.VarName}=1' provou inviabilidade. Fixando '{var.VarName}=0'.")
-            var.UB = 0.0 # Fixa a variável no modelo original
-            variables_fixed += 1
-            
-    return variables_fixed
-
-# --- O Orquestrador de Presolve ---
-def run_presolve(model: gp.Model, original_vars: Dict[str, str]):
-    """
-    Orquestra todas as rotinas de pré-processamento em um loop de ponto fixo.
-    """
+def run_presolve(model: gp.Model, original_vars: Dict[str, str]) -> str:
+    """Orquestra as rotinas de presolve, baseado na estrutura do código de referência."""
     print("-" * 60)
     print("INFO: [Presolve] Iniciando fase de pré-processamento...")
     
-    while True:
+    for i in range(1): # No código de referência, ele roda apenas uma vez
+        print(f"INFO: [Presolve] Passada {i+1}...")
+        
+        # Ordem lógica inspirada no código de referência
+        changes = _fix_from_singletons(model)
+        if changes == -1: return 'INFEASIBLE'
+        
+        changes = _propagate_bounds(model, original_vars)
+        if changes == -1: return 'INFEASIBLE'
+
+        # Probing é executado no final
+        _probe_binary_variables(model, original_vars)
         model.update()
-        total_changes_this_round = 0
         
-        changes = _strengthen_bounds(model, original_vars)
-        total_changes_this_round += changes
-        
-        changes = _remove_redundant_constraints(model)
-        total_changes_this_round += changes
-        
-        changes = _substitute_fixed_variables(model)
-        total_changes_this_round += changes
-
-        changes = _run_probing(model, original_vars)
-        total_changes_this_round += changes
-
-        if total_changes_this_round == 0:
-            print("INFO: [Presolve] Ponto fixo atingido. Nenhuma nova redução encontrada.")
-            break
-    
-    model.update() # Aplica todas as últimas alterações
     print("INFO: [Presolve] Fase de pré-processamento concluída.")
-    print("-" * 60)
+    return 'SUCCESS'

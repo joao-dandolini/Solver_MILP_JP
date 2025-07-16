@@ -20,11 +20,9 @@ class BranchingStrategy(ABC):
         raise NotImplementedError
 
     def update_scores(self, parent_node: Node, child_nodes: List[Node], branch_var: str):
-        """
-        [ATUALIZADO] Opcional: Atualiza os scores internos da estratégia após um branching.
-        Útil para estratégias que aprendem, como pseudo-custos.
-        """
-        pass # A implementação padrão continua não fazendo nada, apenas aceita o argumento.
+        # ...
+        # Esta linha vai falhar, pois 'self' (a estratégia) não tem 'model'
+        is_minimization = self.model.ModelSense == GRB.MINIMIZE
 
 class MostInfeasibleStrategy(BranchingStrategy):
     # A assinatura do método agora corresponde à interface
@@ -40,188 +38,275 @@ class MostInfeasibleStrategy(BranchingStrategy):
             # Só consideramos ramificar em variáveis que NÃO são contínuas.
             if original_vars.get(var_name, GRB.CONTINUOUS) != GRB.CONTINUOUS:
                 if abs(var_value - round(var_value)) > TOLERANCE:
-                    infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
+                    frac = var_value - math.floor(var_value)
+                    infeasibility = 0.5 - abs(frac - 0.5)
+                    #infeasibility = min(frac, 1.0 - frac)
+                    #infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
                     if infeasibility > max_infeasibility:
                         max_infeasibility = infeasibility
                         branching_variable = var_name
                         
         return branching_variable
+    
+    def update_scores(self, parent_node: Node, child_nodes: List[Node], branch_var: str, model: gp.Model):
+        # Esta estratégia não aprende, então o método não faz nada.
+        # Ele só precisa existir para ser compatível com a interface da classe base.
+        pass
 
 class StrongBranchingStrategy(BranchingStrategy):
+    """
+    Implementa a estratégia de Strong Branching.
 
-    def __init__(self, candidate_limit: int = 10):
+    Esta estratégia avalia um subconjunto de variáveis candidatas fracionárias
+    resolvendo temporariamente o LP para os ramos "up" e "down" de cada uma.
+    A variável que promete o maior progresso no dual bound é selecionada.
+    """
+
+    def __init__(self, candidate_limit: int = 5, epsilon: float = 1e-6):
+        """
+        Inicializa a estratégia de Strong Branching.
+
+        Args:
+            candidate_limit (int): O número máximo de variáveis candidatas a serem
+                                 avaliadas em cada nó. Limitar isso é crucial para
+                                 controlar o tempo de execução.
+            epsilon (float): Uma pequena constante para estabilidade numérica na
+                             função de score, evitando multiplicação por zero.
+        """
+        super().__init__()
         self.candidate_limit = candidate_limit
+        self.epsilon = epsilon
+        print(f"INFO: StrongBranchingStrategy inicializada com limite de {candidate_limit} candidatos.")
 
-    def _solve_lookahead_lp(self, base_model: gp.Model, node_bounds: Dict, branch_var: str, val_to_branch: float, direction: str) -> float:
-        # ... código inalterado ...
+    def _solve_lookahead_lp(self, base_model: gp.Model, node: Node, branch_var: str, branch_val: float, direction: str) -> Optional[float]:
         temp_model = base_model.copy()
-        #temp_model.setParam('OutputFlag', 0)
-        temp_model.setParam(GRB.Param.OutputFlag, 0)   # Já tínhamos, mas é bom manter aqui
-        temp_model.setParam(GRB.Param.Presolve, 0)      # Desliga o pré-processamento do modelo
-        temp_model.setParam(GRB.Param.Cuts, 0)          # Desliga todos os geradores de cortes automáticos
-        temp_model.setParam(GRB.Param.Heuristics, 0)    # Desliga todas as heurísticas automáticas (FP, RINS, etc.)
-        temp_model.setParam(GRB.Param.Symmetry, 0) 
+        temp_model.setParam(GRB.Param.OutputFlag, 0)
+        temp_model.setParam(GRB.Param.Presolve, 0)
+        temp_model.setParam(GRB.Param.Cuts, 0)
+        
+        # --- ALTERAÇÃO PRINCIPAL AQUI ---
+        # Não precisamos da solução ótima, apenas de uma boa estimativa do bound.
+        # Limitamos o número de iterações do Simplex.
+        temp_model.setParam(GRB.Param.IterationLimit, 1000) # Valor inicial para teste
 
-        for var_name, bound_info in node_bounds.items():
+        # ... (resto da função para aplicar os bounds)
+        for var_name, bound_info in node.local_bounds.items():
             var = temp_model.getVarByName(var_name)
-            if bound_info['type'] == '<=': var.ub = bound_info['value']
-            else: var.lb = bound_info['value']
-        var_to_branch = temp_model.getVarByName(branch_var)
-        if direction == 'down': var_to_branch.ub = math.floor(val_to_branch)
-        else: var_to_branch.lb = math.ceil(val_to_branch)
+            if bound_info['type'] == '<=':
+                var.ub = bound_info['value']
+            else:
+                var.lb = bound_info['value']
+
+        var_to_branch_obj = temp_model.getVarByName(branch_var)
+        if direction == 'down':
+            var_to_branch_obj.ub = math.floor(branch_val)
+        else:
+            var_to_branch_obj.lb = math.ceil(branch_val)
+        
         temp_model.optimize()
-        if temp_model.Status == GRB.OPTIMAL: return temp_model.ObjVal
-        return float('inf')
-    
+
+        # O resultado ainda é válido mesmo que o Gurobi pare pelo limite de iterações.
+        # Se for um problema de MIN, o ObjVal será um lower bound válido para o nó filho.
+        if temp_model.Status in [GRB.OPTIMAL, GRB.ITERATION_LIMIT]:
+            return temp_model.ObjVal
+        
+        return float('inf') if base_model.ModelSense == GRB.MINIMIZE else -float('inf')
+
     def select_variable(self, node: Node, model: gp.Model, original_vars: Dict[str, str]) -> Optional[str]:
-        # ... código inalterado ...
-        if not node.variable_values: return None
+        if not node.variable_values or node.lp_objective_value is None:
+            return None
+
+        # 1. Coletar todas as variáveis candidatas (que são inteiras e fracionárias)
         TOLERANCE = 1e-6
         all_candidates = []
         for var_name, var_value in node.variable_values.items():
-            if abs(var_value - round(var_value)) > TOLERANCE:
-                infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
-                all_candidates.append({'name': var_name, 'value': var_value, 'score': infeasibility})
-        if not all_candidates: return None
-        all_candidates.sort(key=lambda x: x['score'], reverse=True)
-        limited_candidates = all_candidates[:self.candidate_limit]
-        best_score = -1.0
+            if original_vars.get(var_name) != GRB.CONTINUOUS and abs(var_value - round(var_value)) > TOLERANCE:
+                # Usa a "infeasibility" (proximidade de 0.5) como um pré-score para selecionar os melhores candidatos
+                frac = var_value - math.floor(var_value)
+                infeasibility_score = 0.5 - abs(frac - 0.5)
+                #infeasibility_score = min(frac, 1.0 - frac)
+                all_candidates.append({'name': var_name, 'value': var_value, 'pre_score': infeasibility_score})
+
+        if not all_candidates:
+            return None
+
+        # Ordena para pegar os candidatos mais promissores primeiro
+        all_candidates.sort(key=lambda x: x['pre_score'], reverse=True)
+        
+        # 2. Limitar o número de candidatos a serem avaliados (REQUISITO 1)
+        candidates_to_evaluate = all_candidates[:self.candidate_limit]
+
         best_var = None
-        for cand in limited_candidates:
-            var_name, var_value = cand['name'], cand['value']
-            obj_down = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'down')
-            obj_up = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'up')
-            score = min(obj_down, obj_up)
+        # O score inicial depende do objetivo (maximizar o score)
+        best_score = -1.0 
+        parent_obj_val = node.lp_objective_value
+
+        is_minimization = model.ModelSense == GRB.MINIMIZE
+
+        for cand in candidates_to_evaluate:
+            var_name = cand['name']
+            var_value = cand['value']
+            
+            # Realiza o lookahead para ambos os ramos
+            obj_down = self._solve_lookahead_lp(model, node, var_name, var_value, 'down')
+            obj_up = self._solve_lookahead_lp(model, node, var_name, var_value, 'up')
+            
+            # Calcula o ganho (degradação do objetivo) para cada ramo
+            # Para MIN, um ganho maior (mais positivo) é melhor. Para MAX, um ganho menor (mais negativo) é melhor.
+            if is_minimization:
+                gain_down = obj_down - parent_obj_val
+                gain_up = obj_up - parent_obj_val
+            else: # Maximização
+                gain_down = parent_obj_val - obj_down
+                gain_up = parent_obj_val - obj_up
+
+            # 3. Calcula o score usando a função produto (REQUISITO 2)
+            # Referência: Tese de T. Achterberg, Seção 5.4, Equação 5.2
+            # Esta função de score favorece variáveis que produzem bons ganhos em AMBOS os ramos.
+            score = max(gain_down, self.epsilon) * max(gain_up, self.epsilon)
+            
             if score > best_score:
                 best_score = score
                 best_var = var_name
+                
         return best_var
 
+    def update_scores(self, parent_node: Node, child_nodes: List[Node], branch_var: str, model: gp.Model):
+        # Esta estratégia não aprende por si só; a lógica de aprendizado
+        # está na classe filha PseudoCostStrategy.
+        pass
+    
 class PseudoCostStrategy(StrongBranchingStrategy):
     """
     Implementa Reliability Branching usando Pseudo-custos.
-    
-    Usa Strong Branching para 'aprender' sobre as variáveis no início
-    e depois muda para uma estimativa de custo barata para o resto da busca.
-    Herda de StrongBranching para reutilizar o método _solve_lookahead_lp.
+
+    Esta é uma estratégia híbrida que equilibra o custo e o benefício do
+    strong branching. Ela usa o custoso strong branching para "aprender"
+    sobre o impacto de uma variável (fase de inicialização) e, uma vez
+    que a informação é considerada confiável, passa a usar uma estimativa
+    matemática barata (o pseudo-custo) para o resto da busca.
+
+    Herda de StrongBranchingStrategy para reutilizar a lógica de lookahead.
     """
-    def __init__(self, original_vars: Dict[str, str], reliability_threshold: int = 2, candidate_limit: int = 10):
+    def __init__(self, original_vars: Dict[str, str],
+                 candidate_limit: int = 10,
+                 reliability_threshold: int = 2):
+        """
+        Inicializa a estratégia de Pseudo-custo.
+
+        Args:
+            original_vars (Dict): Mapa de nomes de variáveis para seus tipos.
+            candidate_limit (int): Limite de candidatos para a fase de strong branching.
+            reliability_threshold (int): Número de vezes que uma variável precisa ser
+                                         avaliada com strong branching antes de ser
+                                         considerada "confiável" para usar pseudo-custos.
+        """
         super().__init__(candidate_limit=candidate_limit)
-        self.original_vars = original_vars # Armazena o dicionário
+        
+        self.original_vars = original_vars
         self.reliability_threshold = reliability_threshold
-        # Estruturas para armazenar o aprendizado
-        self.pseudo_costs_sum_degradation = {} # {var_name: {'down': float, 'up': float}}
-        self.pseudo_costs_sum_fractionality = {}
-        self.pseudo_costs_reliability_count = {}
+        
+        # Estruturas de dados para armazenar o histórico de aprendizado
+        self.pseudo_costs_sum_degradation: Dict[str, Dict[str, float]] = {}
+        self.pseudo_costs_sum_fractionality: Dict[str, Dict[str, float]] = {}
+        self.pseudo_costs_reliability_count: Dict[str, int] = {}
+        
+        print(f"INFO: PseudoCostStrategy inicializada com reliability_threshold={self.reliability_threshold}.")
 
     def select_variable(self, node: Node, model: gp.Model, original_vars: Dict[str, str]) -> Optional[str]:
-        print("\n[DEBUG-STRATEGY] >>> Dentro de PseudoCostStrategy.select_variable <<<")
-        if node.variable_values:
-            print(f"[DEBUG-STRATEGY] Nó recebido tem {len(node.variable_values)} valores de variáveis.")
-        else:
-            print("[DEBUG-STRATEGY] ERRO: Nó recebido sem valores de variáveis!")
-        # --- FIM DO NOVO PRINT ---
-        # Verificação de segurança 1: Se o nó for inviável, não há o que fazer.
-        if node.lp_objective_value is None:
-            return None
-            
-        # Verificação de segurança 2: Se não houver valores de variáveis.
-        if not node.variable_values:
+        if not node.variable_values or node.lp_objective_value is None:
             return None
 
-        # Passo 1: Filtra apenas as variáveis fracionárias para análise.
+        # 1. Coletar e pré-selecionar os melhores candidatos
         TOLERANCE = 1e-6
-        fractional_vars = {
-            k: v for k, v in node.variable_values.items() 
-            if self.original_vars.get(k) != GRB.CONTINUOUS and abs(v - round(v)) > TOLERANCE
-        }
-
-        # --- NOVO PRINT DE DEPURAÇÃO ---
-        print(f"[DEBUG-STRATEGY] Encontradas {len(fractional_vars)} variáveis fracionárias.")
-        if not fractional_vars and node.variable_values:
-            print("[DEBUG-STRATEGY] Nenhuma var fracionária encontrada! Amostra de 10 valores recebidos:")
-            for i, (k, v) in enumerate(node.variable_values.items()):
-                if i >= 10: break
-                print(f"  - Var '{k}': Valor={v:.6f} (Tipo Original: {self.original_vars.get(k)})")
-        # --- FIM DO NOVO PRINT ---
-
-        if not fractional_vars:
-            return None # Nenhuma variável fracionária para ramificar.
-
-        # Passo 2: Pré-seleciona as candidatas mais promissoras com a heurística barata.
         all_candidates = []
-        for var_name, var_value in fractional_vars.items():
-            infeasibility = 0.5 - abs((var_value - math.floor(var_value)) - 0.5)
-            all_candidates.append({'name': var_name, 'value': var_value, 'score': infeasibility})
+        for var_name, var_value in node.variable_values.items():
+            if self.original_vars.get(var_name) != GRB.CONTINUOUS and abs(var_value - round(var_value)) > TOLERANCE:
+                frac = var_value - math.floor(var_value)
+                infeasibility_score = 0.5 - abs(frac - 0.5)
+                #infeasibility_score = min(frac, 1.0 - frac)
+                all_candidates.append({'name': var_name, 'value': var_value, 'pre_score': infeasibility_score})
         
-        all_candidates.sort(key=lambda x: x['score'], reverse=True)
-        limited_candidates = all_candidates[:self.candidate_limit]
+        if not all_candidates: return None
+        all_candidates.sort(key=lambda x: x['pre_score'], reverse=True)
+        candidates_to_evaluate = all_candidates[:self.candidate_limit]
 
-        # Passo 3: Calcula o score para as candidatas (usando strong ou pseudo-custo).
-        best_score = -1.0
+        # 2. Avaliar candidatos com a lógica híbrida
         best_var = None
+        best_score = -1.0
+        parent_obj_val = node.lp_objective_value
+        is_minimization = model.ModelSense == GRB.MINIMIZE
 
-        for cand in limited_candidates:
+        for cand in candidates_to_evaluate:
             var_name = cand['name']
             var_value = cand['value']
-            reliability = self.pseudo_costs_reliability_count.get(var_name, 0)
+            
+            reliability_count = self.pseudo_costs_reliability_count.get(var_name, 0)
 
-            if reliability < self.reliability_threshold:
-                # Usa strong branching para aprender
-                obj_down = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'down')
-                obj_up = self._solve_lookahead_lp(model, node.local_bounds, var_name, var_value, 'up')
-                score = min(obj_down, obj_up)
+            # --- O CORAÇÃO DA ESTRATÉGIA HÍBRIDA ---
+            if reliability_count < self.reliability_threshold:
+                # VARIÁVEL NÃO CONFIÁVEL: Usa Strong Branching para aprender
+                obj_down = self._solve_lookahead_lp(model, node, var_name, var_value, 'down')
+                obj_up = self._solve_lookahead_lp(model, node, var_name, var_value, 'up')
+                
+                gain_down = (obj_down - parent_obj_val) if is_minimization else (parent_obj_val - obj_down)
+                gain_up = (obj_up - parent_obj_val) if is_minimization else (parent_obj_val - obj_up)
             else:
-                # Usa a estimativa de pseudo-custo
+                # VARIÁVEL CONFIÁVEL: Usa a estimativa de pseudo-custo (rápida)
+                sum_deg = self.pseudo_costs_sum_degradation.get(var_name, {'down': 0.0, 'up': 0.0})
+                sum_frac = self.pseudo_costs_sum_fractionality.get(var_name, {'down': 0.0, 'up': 0.0})
+
+                # CORREÇÃO: Adicionar self.epsilon ao denominador para garantir estabilidade numérica.
+                # Se a soma da fracionalidade for 0, o pseudo-custo resultante será 0.
+                pc_down = sum_deg['down'] / (sum_frac['down'] + self.epsilon)
+                pc_up   = sum_deg['up']   / (sum_frac['up']   + self.epsilon)
+                
                 frac = var_value - math.floor(var_value)
-                pc_down_sum_deg = self.pseudo_costs_sum_degradation[var_name]['down']
-                pc_down_sum_frac = self.pseudo_costs_sum_fractionality[var_name]['down']
-                pc_up_sum_deg = self.pseudo_costs_sum_degradation[var_name]['up']
-                pc_up_sum_frac = self.pseudo_costs_sum_fractionality[var_name]['up']
+                gain_down = pc_down * frac
+                gain_up = pc_up * (1.0 - frac)
 
-                pc_down = (pc_down_sum_deg / pc_down_sum_frac) if pc_down_sum_frac > TOLERANCE else 0
-                pc_up = (pc_up_sum_deg / pc_up_sum_frac) if pc_up_sum_frac > TOLERANCE else 0
-
-                estimated_obj_down = node.lp_objective_value + pc_down * frac
-                estimated_obj_up = node.lp_objective_value + pc_up * (1 - frac)
-                score = min(estimated_obj_down, estimated_obj_up)
+            # A função de score produto é usada em ambos os casos
+            score = max(gain_down, self.epsilon) * max(gain_up, self.epsilon)
 
             if score > best_score:
                 best_score = score
                 best_var = var_name
-        
+                
         return best_var
 
-    def update_scores(self, parent_node: Node, child_nodes: List[Node], branch_var: str):
-            """
-            [CORRIGIDO] Atualiza os dados de pseudo-custo, lidando com ramos inviáveis.
-            """
-            # Verificação de segurança: se o nó pai não tiver um valor, não há o que aprender.
-            if parent_node.lp_objective_value is None:
-                return
+    def update_scores(self, parent_node: Node, child_nodes: List[Node], branch_var: str, model: gp.Model):
+        """
+        Após um branch ser realizado, esta função é chamada para atualizar o histórico
+        da variável `branch_var`, alimentando o aprendizado dos pseudo-custos.
+        """
+        if parent_node.lp_objective_value is None or not parent_node.variable_values:
+            return
 
-            parent_obj = parent_node.lp_objective_value
-            parent_val = parent_node.variable_values[branch_var]
-            frac = parent_val - math.floor(parent_val)
+        parent_obj = parent_node.lp_objective_value
+        parent_val = parent_node.variable_values[branch_var]
+        frac = parent_val - math.floor(parent_val)
 
-            TOLERANCE_DIV = 1e-9
-            if branch_var not in self.pseudo_costs_sum_degradation:
-                self.pseudo_costs_sum_degradation[branch_var] = {'down': 0.0, 'up': 0.0}
-                self.pseudo_costs_sum_fractionality[branch_var] = {'down': TOLERANCE_DIV, 'up': TOLERANCE_DIV}
-                self.pseudo_costs_reliability_count[branch_var] = 0
+        self.pseudo_costs_sum_degradation.setdefault(branch_var, {'down': 0.0, 'up': 0.0})
+        self.pseudo_costs_sum_fractionality.setdefault(branch_var, {'down': 0.0, 'up': 0.0})
+        self.pseudo_costs_reliability_count.setdefault(branch_var, 0)
+        
+        # CORREÇÃO: Usa o 'model' passado como parâmetro, não 'self.model'
+        is_minimization = model.ModelSense == GRB.MINIMIZE
+        
+        child_down = next((n for n in child_nodes if n.local_bounds.get(branch_var, {}).get('type') == '<='), None)
+        child_up = next((n for n in child_nodes if n.local_bounds.get(branch_var, {}).get('type') == '>='), None)
 
-            # Verifica o ramo 'down' antes de fazer contas
-            child_down = next((n for n in child_nodes if branch_var in n.local_bounds and n.local_bounds[branch_var]['type'] == '<='), None)
-            if child_down and child_down.lp_objective_value is not None:
-                degradation = max(0, child_down.lp_objective_value - parent_obj)
-                self.pseudo_costs_sum_degradation[branch_var]['down'] += degradation
-                self.pseudo_costs_sum_fractionality[branch_var]['down'] += frac
+        # O resto da função permanece igual...
+        if child_down and child_down.lp_objective_value is not None:
+            degradation = (child_down.lp_objective_value - parent_obj) if is_minimization else (parent_obj - child_down.lp_objective_value)
+            self.pseudo_costs_sum_degradation[branch_var]['down'] += max(0, degradation)
+            self.pseudo_costs_sum_fractionality[branch_var]['down'] += frac
+            
+        if child_up and child_up.lp_objective_value is not None:
+            degradation = (child_up.lp_objective_value - parent_obj) if is_minimization else (parent_obj - child_up.lp_objective_value)
+            self.pseudo_costs_sum_degradation[branch_var]['up'] += max(0, degradation)
+            self.pseudo_costs_sum_fractionality[branch_var]['up'] += (1.0 - frac)
 
-            # Verifica o ramo 'up' antes de fazer contas
-            child_up = next((n for n in child_nodes if branch_var in n.local_bounds and n.local_bounds[branch_var]['type'] == '>='), None)
-            if child_up and child_up.lp_objective_value is not None:
-                degradation = max(0, child_up.lp_objective_value - parent_obj)
-                self.pseudo_costs_sum_degradation[branch_var]['up'] += degradation
-                self.pseudo_costs_sum_fractionality[branch_var]['up'] += (1 - frac)
+        self.pseudo_costs_reliability_count[branch_var] += 1
 
-            self.pseudo_costs_reliability_count[branch_var] += 1
+#

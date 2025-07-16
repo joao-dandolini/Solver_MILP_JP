@@ -57,6 +57,7 @@ class Tree:
         # Rastreia o best bound em modo DFS para evitar varreduras O(N).
         root_obj = root_node.lp_objective_value
         self._dfs_best_bound: float = root_obj if root_obj is not None else float('inf')
+        self.nodes_map: Dict[int, Node] = {root_node.id: root_node}
 
     def add_nodes(self, nodes: List[Node]):
         """
@@ -73,7 +74,17 @@ class Tree:
             self._dfs_best_bound = min(self._dfs_best_bound, min_obj_in_new_nodes)
         else: # Modo BEST_BOUND
             for node in nodes:
-                heapq.heappush(self._best_bound_queue, (node.lp_objective_value, node.id, node))
+                # REMOVA O IF. Nós precisamos adicionar o nó mesmo sem um valor de objetivo.
+                # A fila de prioridade do Python (heapq) lida com 'None' corretamente
+                # por padrão, colocando-o no início, o que é um comportamento aceitável.
+                # Para garantir a ordem, podemos usar um valor padrão.
+                
+                # Usamos o valor do objetivo ou -inf para garantir que nós não resolvidos
+                # sejam processados primeiro em um problema de MINIMIZAÇÃO.
+                priority = node.lp_objective_value if node.lp_objective_value is not None else -float('inf')
+                heapq.heappush(self._best_bound_queue, (priority, node.id, node))
+        for node in nodes:
+                self.nodes_map[node.id] = node
 
     def get_next_node(self) -> Optional[Node]:
         """
@@ -99,19 +110,36 @@ class Tree:
         """
         return not self._dfs_stack and not self._best_bound_queue
 
+# Em tree_elements.py
+
     def switch_to_best_bound_mode(self):
         """
         Converte a árvore do modo DFS para o modo Best-Bound.
         """
         if self.mode == 'DFS':
-            print("INFO: [Tree] Trocando estratégia de busca para BEST-BOUND.")
+            print("\n" + "="*20 + " INICIANDO TROCA DE MODO " + "="*20)
+            
+            # --- Log de Auditoria - ANTES ---
+            num_nodes_before = len(self._dfs_stack)
+            print(f"[AUDITORIA] Nós na pilha DFS (antes da troca): {num_nodes_before}")
+
             self.mode = 'BEST_BOUND'
             
+            nodes_moved = 0
             for node in self._dfs_stack:
                 if node.lp_objective_value is not None:
                     heapq.heappush(self._best_bound_queue, (node.lp_objective_value, node.id, node))
+                    nodes_moved += 1
             
             self._dfs_stack = []
+
+            # --- Log de Auditoria - DEPOIS ---
+            num_nodes_after = len(self._best_bound_queue)
+            print(f"[AUDITORIA] Nós movidos para a fila de prioridade: {nodes_moved}")
+            print(f"[AUDITORIA] Nós na fila de prioridade (depois da troca): {num_nodes_after}")
+            if num_nodes_before > 0 and num_nodes_after == 0:
+                print("[AUDITORIA-ERRO] ALERTA! Todos os nós foram perdidos na troca!")
+            print("="*66 + "\n")
 
     def get_current_best_bound(self) -> float:
         """

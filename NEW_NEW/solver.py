@@ -37,6 +37,73 @@ class MILPSolver:
         self.tree: Tree = None
         self.added_cuts_pool = set()
 
+    def _apply_and_solve_lp_for_node(self, node_to_process: Node):
+        """
+        Configura o modelo LP de trabalho para o estado de um nó específico,
+        resolve o LP e atualiza o nó com o resultado.
+        """
+        # Esta função é a chave para a correção.
+        # Ela garante que nosso LP de trabalho está sempre sincronizado
+        # com o nó que estamos prestes a avaliar.
+        
+        # 1. Pega uma referência ao nosso modelo de trabalho persistente
+        lp = self.lp_model_for_relaxations
+
+        # 2. Desfaz os bounds do nó anterior e aplica os novos.
+        # Uma forma simples de garantir o estado correto é resetar e aplicar.
+        # (Uma versão mais otimizada poderia "desfazer" apenas as diferenças)
+        
+        # Restaura todos os bounds para os do problema original relaxado
+        for var in lp.getVars():
+            orig_var = self.original_milp_model.getVarByName(var.VarName)
+            var.lb = orig_var.LB
+            var.ub = orig_var.UB
+
+        # Aplica os bounds específicos do nó atual
+        for var_name, bound_info in node_to_process.local_bounds.items():
+            var = lp.getVarByName(var_name)
+            if bound_info['type'] == '<=':
+                var.ub = bound_info['value']
+            else:
+                var.lb = bound_info['value']
+        
+        # 3. Resolve o LP para o nó atual
+        lp.optimize()
+        
+        # 4. Atualiza o objeto do nó com sua própria solução de LP
+        if lp.Status == GRB.OPTIMAL:
+            all_vars = {v.VarName: v.X for v in lp.getVars()}
+            is_int = self._is_solution_integer(all_vars)
+            node_to_process.set_lp_solution('OPTIMAL', lp.ObjVal, all_vars, is_int)
+        else:
+            node_to_process.set_lp_solution('INFEASIBLE', None, None, False)
+
+    def is_node_promising(self, node: Node) -> bool:
+        """
+        Verifica se um nó é promissor para exploração (poda por bound).
+
+        Um nó não é promissor se seu limitante dual (lp_objective_value)
+        já for pior que a melhor solução inteira encontrada (incumbent_value).
+
+        Args:
+            node: O nó a ser verificado.
+
+        Returns:
+            True se o nó for promissor, False caso contrário.
+        """
+        if node.lp_objective_value is None:
+            return False
+
+        # Para problemas de MINIMIZAÇÃO:
+        if self.model_sense == GRB.MINIMIZE:
+            # O nó só é promissor se seu lower bound for MENOR que o incumbent.
+            return node.lp_objective_value < self.incumbent_value
+        
+        # Para problemas de MAXIMIZAÇÃO:
+        else:
+            # O nó só é promissor se seu upper bound for MAIOR que o incumbent.
+            return node.lp_objective_value > self.incumbent_value
+
     def _get_branching_strategy(self) -> BranchingStrategy:
         """
         Instancia a estratégia de branching com base na configuração.
@@ -327,10 +394,17 @@ class MILPSolver:
             self.incumbent_value = float('inf')
             self.best_bound = -float('inf')
             print("INFO: Problema de MINIMIZAÇÃO detectado.")
-            
+
         # --- 2. PRESOLVE (OPCIONAL) ---
         if self.config.get('use_presolve', False):
-            run_presolve(self.model, self.original_vars)
+            # CORREÇÃO: Captura o status retornado e verifica
+            presolve_status = run_presolve(self.model, self.original_vars)
+            
+            if presolve_status == 'INFEASIBLE':
+                self.logger.log_summary('Infeasible', 0, None, None)
+                return # Para o solver completamente
+
+            # Se o presolve foi bem-sucedido, continua normalmente
             self.model.update()
             self.original_vars = {v.VarName: v.VType for v in self.model.getVars()}
             self.original_milp_model = self.model.copy()
@@ -389,6 +463,8 @@ class MILPSolver:
                 self.tree.switch_to_best_bound_mode()
 
             current_node = self.tree.get_next_node()
+
+            
 
             # --- 8. GERAÇÃO DE CORTES LOCAIS (ITERATIVO, OPCIONAL) ---
             cut_freq = self.config.get('cut_frequency', 0)
@@ -454,43 +530,75 @@ class MILPSolver:
                 continue
 
             val = current_node.variable_values[branch_var_name]
+            var_obj = self.lp_model_for_relaxations.getVarByName(branch_var_name)
 
-            # --- PRINT DE DEPURAÇÃO 1 ---
-            #print("\n" + "="*20 + " DEBUG BRANCH " + "="*20)
-            #print(f"Nó Pai ID: {current_node.id}, Obj: {current_node.lp_objective_value:.4f}")
-            #print(f"Variável de Branching: '{branch_var_name}', Valor: {val:.4f}")
-            #print(f"-> Criando filho 1 com bound: {branch_var_name} <= {math.floor(val)}")
-            #print(f"-> Criando filho 2 com bound: {branch_var_name} >= {math.ceil(val)}")
-            # --- FIM DO PRINT 1 ---
+            # --- Lógica de Warm Start para os Filhos ---
             
-            bounds1 = {**current_node.local_bounds, branch_var_name: {'type': '<=', 'value': math.floor(val)}}
-            child1 = Node(parent_id=current_node.id, depth=current_node.depth + 1, local_bounds=bounds1)
-            # Passe o modelo LP
-            self._solve_lp_relaxation(child1, self.lp_model_for_relaxations)
+            # Primeiro, guardamos os bounds originais da variável antes de modificar
+            original_lb = var_obj.LB
+            original_ub = var_obj.UB
 
-            bounds2 = {**current_node.local_bounds, branch_var_name: {'type': '>=', 'value': math.ceil(val)}}
-            child2 = Node(parent_id=current_node.id, depth=current_node.depth + 1, local_bounds=bounds2)
-            # Passe o modelo LP
-            self._solve_lp_relaxation(child2, self.lp_model_for_relaxations)
+            new_nodes_to_add = []
 
-            self.branching_strategy.update_scores(parent_node=current_node, child_nodes=[child1, child2], branch_var=branch_var_name)
+            # --- Processa o filho 1 (ramo 'down') ---
+            child1_bounds = {**current_node.local_bounds, branch_var_name: {'type': '<=', 'value': math.floor(val)}}
+            child1 = Node(parent_id=current_node.id, depth=current_node.depth + 1, local_bounds=child1_bounds)
             
-            # --- PRINT DE DEPURAÇÃO 2 ---
-            #print(f"Status Filho 1 (<=): {child1.lp_status}, Obj: {child1.lp_objective_value}")
-            #print(f"Status Filho 2 (>=): {child2.lp_status}, Obj: {child2.lp_objective_value}")
-            #print("="*54 + "\n")
-            # --- FIM DO PRINT 2 ---
+            # Modifica o modelo de trabalho
+            var_obj.UB = math.floor(val)
+            
+            # Otimiza (Gurobi usará a base do pai como warm start)
+            self.lp_model_for_relaxations.optimize()
+            
+            # Preenche o nó filho com a solução
+            status = self.lp_model_for_relaxations.Status
+            if status == GRB.OPTIMAL:
+                all_vars = {v.VarName: v.X for v in self.lp_model_for_relaxations.getVars()}
+                is_int = self._is_solution_integer(all_vars)
+                child1.set_lp_solution('OPTIMAL', self.lp_model_for_relaxations.ObjVal, all_vars, is_int)
+                new_nodes_to_add.append(child1)
+            else:
+                child1.set_lp_solution('INFEASIBLE', None, None, False)
 
-            new_nodes = []
-            if child1.lp_status == 'OPTIMAL':
-                is_promising1 = (child1.lp_objective_value < self.incumbent_value) if self.model_sense == GRB.MINIMIZE else (child1.lp_objective_value > self.incumbent_value)
-                if is_promising1: new_nodes.append(child1)
+            # CRUCIAL: Restaura o bound para o estado do nó pai
+            var_obj.UB = original_ub
+
+            # --- Processa o filho 2 (ramo 'up') ---
+            child2_bounds = {**current_node.local_bounds, branch_var_name: {'type': '>=', 'value': math.ceil(val)}}
+            child2 = Node(parent_id=current_node.id, depth=current_node.depth + 1, local_bounds=child2_bounds)
+
+            # Modifica o modelo de trabalho na outra direção
+            var_obj.LB = math.ceil(val)
             
-            if child2.lp_status == 'OPTIMAL':
-                is_promising2 = (child2.lp_objective_value < self.incumbent_value) if self.model_sense == GRB.MINIMIZE else (child2.lp_objective_value > self.incumbent_value)
-                if is_promising2: new_nodes.append(child2)
+            # Otimiza novamente (ainda partindo da base do pai)
+            self.lp_model_for_relaxations.optimize()
             
-            self.tree.add_nodes(new_nodes)
+            # Preenche o nó filho com a solução
+            status = self.lp_model_for_relaxations.Status
+            if status == GRB.OPTIMAL:
+                all_vars = {v.VarName: v.X for v in self.lp_model_for_relaxations.getVars()}
+                is_int = self._is_solution_integer(all_vars)
+                child2.set_lp_solution('OPTIMAL', self.lp_model_for_relaxations.ObjVal, all_vars, is_int)
+                new_nodes_to_add.append(child2)
+            else:
+                child2.set_lp_solution('INFEASIBLE', None, None, False)
+            
+            # CRUCIAL: Restaura o bound final para o estado do nó pai
+            var_obj.LB = original_lb
+            
+            # --- Fim da lógica de Warm Start ---
+
+            # A função de aprendizado do pseudo-custo ainda é chamada aqui
+            self.branching_strategy.update_scores(parent_node=current_node, child_nodes=[child1, child2], branch_var=branch_var_name, model=self.model)
+            
+            # Adiciona os nós promissores à árvore
+            promising_nodes = []
+            if child1.lp_status == 'OPTIMAL' and self.is_node_promising(child1):
+                promising_nodes.append(child1)
+            if child2.lp_status == 'OPTIMAL' and self.is_node_promising(child2):
+                promising_nodes.append(child2)
+
+            self.tree.add_nodes(promising_nodes)
             
             if not self.tree.is_empty():
                 self.best_bound = self.tree.get_current_best_bound()

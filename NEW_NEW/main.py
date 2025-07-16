@@ -9,8 +9,8 @@ import traceback
 # Defina seu arquivo de teste padrão aqui para facilitar a execução.
 # Altere este caminho para o local do seu arquivo .mps de teste principal.
 #DEFAULT_PROBLEM_PATH = "./tests/mas76.mps"
-#DEFAULT_PROBLEM_PATH = "./tests/instance_0003.mps"
-DEFAULT_PROBLEM_PATH = "./tests/Archive/model_S1_Jc0_Js9_T96.mps"
+DEFAULT_PROBLEM_PATH = "./tests/instance_0003.mps"
+#DEFAULT_PROBLEM_PATH = "./tests/Archive/model_S1_Jc0_Js9_T96.mps"
 
 #DEFAULT_PROBLEM_PATH = "./gomory_source.lp"
 
